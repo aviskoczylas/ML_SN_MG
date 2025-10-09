@@ -7,10 +7,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.special import lpmv
 from numba import njit
-
 print(time.time()-start_time)
 
-#TODO to hpc tod
 #TODO implement vacuum bc
 #TODO Write fixed source as Fourier Expansion
 #random numbers for s2, s3.
@@ -113,6 +111,7 @@ def flux_to_moments(angular_flux, direction):
 
 prev_fission_source, prev_g2g_source = None, None
 
+bc_type = "reflecting" #options are fixed, reflecting, and vacuum
 reflecting = True
 incoming_moments_l = np.array([0.1,0]) #for constant bc, this is a given. For reflecting BC, this is a guess
 incoming_moments_r = np.array([0.1,0]) #only used for the case of constant bc
@@ -149,10 +148,12 @@ def transport_sweep(group, group_source, left_edge_cell_flux):
         left_edge_cell_flux = right_edge_cell_flux
         group_flux_moments[i,:] += flux_to_moments(current_cell_avg_flux,1)
     # apply reflecting boundary condition to compute inward right angular fluxes
-    if reflecting:
+    if bc_type == "reflecting":
         right_edge_cell_flux = np.flip(left_edge_cell_flux) 
-    else:
+    elif bc_type == "fixed":
         right_edge_cell_flux = moments_to_flux(incoming_moments_r)[num_ordinates//2:]
+    elif bc_type == "vacuum": 
+        right_edge_cell_flux = np.zeros(num_ordinates//2)
 # 	loop over spatial zones from right boundary to left boundary:
     for i in range(num_sections-1,-1,-1): 
         section_index = int(np.floor(i*dx))
@@ -172,10 +173,12 @@ def transport_sweep(group, group_source, left_edge_cell_flux):
         right_edge_cell_flux = left_edge_cell_flux
         group_flux_moments[i,:] += flux_to_moments(current_cell_avg_flux,-1)
 # 	apply reflecting boundary condition to compute inward left angular fluxes
-    if reflecting:
+    if bc_type == "reflecting":
         left_edge_cell_flux = np.flip(right_edge_cell_flux)
-    else:
+    elif bc_type == "fixed":
         left_edge_cell_flux = moments_to_flux(incoming_moments_l)[:num_ordinates//2]
+    elif bc_type == "vacuum":
+        left_edge_cell_flux = np.zeros(num_ordinates//2)
     return (group_flux_moments, left_edge_cell_flux)
                 
 
