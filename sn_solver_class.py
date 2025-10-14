@@ -2,6 +2,8 @@ import time
 start_time = time.time()
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 from numpy.polynomial.legendre import leggauss
 from scipy.special import lpmv
 from numba import njit, prange
@@ -203,7 +205,7 @@ class Sn:
         self.scatter_mats_sec = None
 
         self._load_or_build_data()
-        self.build_geometry(seed=10, p_U=0.5, verbose=True)
+        self.build_geometry(seed=10, p_U=0.8, verbose=True)
 
     @staticmethod
     def _safe_load_csv(path, sep, cols=None):
@@ -251,9 +253,8 @@ class Sn:
         if s > 0: self.chi /= s
 
         if sigma_f_raw is not None and sigma_f_raw.shape[1] >= 2:
-            self.sigma_f = self.get_data(sigma_f_raw, self.nbins, self.E0, self.Emin)[:-1, 1]
-        else:
-            self.sigma_f = np.zeros(self.num_groups)
+            self.sigma_f = 5 * (self.get_data(sigma_f_raw, self.nbins, self.E0, self.Emin)[:-1, 1])
+        else: self.sigma_f = np.zeros(self.num_groups)
 
         self.xsH_gtg = self._build_sigma_gtg(self.AH, self.sig_s0_H)
         self.xsU_gtg = self._build_sigma_gtg(self.AU, self.sig_s0_U)
@@ -461,8 +462,9 @@ class Sn:
 
         Nh = N // 2
         if self.bc_type == "fixed":
-            left_in = self.moments_to_flux(np.asarray([0.1] + [0.0]*(L-1))[None, :])[0, :Nh]
-            right_in = self.moments_to_flux(np.asarray([0.1] + [0.0]*(L-1))[None, :])[0, Nh:]
+            m0 = 2.0  # try 1~5 to test sensitivity; ψ_in ≈ m0/2
+            left_in  = self.moments_to_flux(np.asarray([m0] + [0.0]*(L-1))[None, :])[0, :Nh]
+            right_in = self.moments_to_flux(np.asarray([m0] + [0.0]*(L-1))[None, :])[0, Nh:]
         else:
             left_in = np.zeros(Nh)
             right_in = np.zeros(Nh)
@@ -503,16 +505,17 @@ class Sn:
             l2 = num / den
             print(f"[outer {it}] L2={l2:.3e}, k≈{k:.6f}")
             flux = flux_new
-            if l2 < eps_outer: break
+            if l2 < eps_outer:
+                break
 
         return flux, k
 
 # run
-num_ordinates = 64
+num_ordinates = 32
 num_groups = 8
-num_nodes = 128
+num_nodes = 64
 NH = 5
-dx = 0.1
+dx = 0.01
 
 sn = Sn(num_ordinates, num_groups, num_nodes, NH, dx, bc_type="reflecting")
 flux_moments, k_eff = sn.run_parallel()
@@ -521,3 +524,51 @@ print("k_eff ~", k_eff)
 avg_phi_g = scalar_flux.mean(axis=0)
 print("Avg scalar flux per group:", np.array2string(avg_phi_g, precision=4))
 print("Elapsed:", time.time() - start_time, "s")
+
+S, N, G = sn.num_sections, sn.num_ordinates, sn.num_groups
+scalar_flux = flux_moments[:, 0, :]                   # (S, G)
+mat = sn.mat_per_section  # 0=H(A=1), 1=U(A=238)
+
+def shade_material(ax):
+    C = sn.num_nodes
+    cells = sn.cell_layout  # 0=H, 1=U per node
+    i = 0
+    while i < C:
+        m = cells[i]
+        j = i + 1
+        while j < C and cells[j] == m:
+            j += 1
+        ax.axvspan(i - 0.5, j - 0.5, color=('blue' if m == 0 else 'red'),
+                   alpha=0.12, linewidth=0)
+        i = j
+
+save_dir = "charts"
+for g in range(G):
+    # Angular flux colorplot
+    ang = sn.moments_to_flux(flux_moments[:, :, g])  
+    fig, ax = plt.subplots(figsize=(6, 3.8))
+    im = ax.imshow(ang.T, aspect='auto', origin='lower',
+                   extent=[0, sn.num_nodes, -1, 1], interpolation='nearest')
+    ax.set_title(f"Group {g} — Angular flux")
+    ax.set_xlabel("Section")
+    ax.set_ylabel("μ")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.set_ylabel("ψ")
+    fig.savefig(f"{save_dir}/psi_g{g}.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # Scalar flux scatter with H/U shading
+    x = sn.section_index_to_cell
+    fig, ax = plt.subplots(figsize=(6, 3.2))
+    shade_material(ax)
+    ax.plot(x, scalar_flux[:, g])
+    ax.set_title(f"Group {g} — Scalar flux")
+    ax.set_xlabel("Section")
+    ax.set_ylabel("ϕ₀")
+    # optional legend
+    legend_patches = [Patch(facecolor='blue', alpha=0.12, label='A=1 (H)'),
+                      Patch(facecolor='red',  alpha=0.12, label='A=238 (U)')]
+    ax.legend(handles=legend_patches, loc='upper right', frameon=False)
+    fig.savefig(f"{save_dir}/phi_g{g}.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
