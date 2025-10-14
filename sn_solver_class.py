@@ -1,401 +1,523 @@
 import time
 start_time = time.time()
-import os
-import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import pandas as pd
+from numpy.polynomial.legendre import leggauss
 from scipy.special import lpmv
 from numba import njit, prange
-print(time.time()-start_time)
 
-#TODO implement vacuum bc
-#TODO Write fixed source as Fourier Expansion
-#random numbers for s2, s3.
+@njit(fastmath=True)
+def _half_moment(leg, w, psi):
+    L = leg.shape[0]
+    Nh = w.size
+    out = np.zeros(L)
+    for l in range(L):
+        acc = 0.0
+        for n in range(Nh):
+            acc += leg[l, n] * w[n] * psi[n]
+        out[l] = acc
+    return out
 
-class Sn():
-    def __init__(self,num_ords, num_groups, num_nodes, NH, dx):
-        self.num_ordinates = num_ords
-        self.num_groups = num_groups
-        self.num_nodes = num_nodes
-        self.cell_index = np.linspace(1,self.num_nodes,self.num_nodes)
+@njit(fastmath=True)
+def _sweep_sc_one_group(sigt_g, dx, mu_pos, mu_neg, src, leg_pos, leg_neg, w_pos, w_neg,
+                        bc_type, left_in_pos, right_in_neg):
+    S = sigt_g.size
+    L = leg_pos.shape[0]
+    Nh = mu_pos.size
+    mom = np.zeros((S, L))
+
+    psi_in = np.zeros(Nh)
+    for j in range(Nh):
+        psi_in[j] = 0.0 if bc_type != 1 else left_in_pos[j]
+
+    for i in range(S):
+        sigt = sigt_g[i]
+        q    = src[i, :Nh]
+        tau  = sigt * dx / mu_pos
+        e    = np.exp(-tau)
+
+        psi_out = psi_in * e + (q / sigt) * (1.0 - e)
+
+        t1 = np.empty_like(tau)
+        for n in range(Nh):
+            t1[n] = (1.0 - e[n]) / tau[n] if tau[n] > 1e-12 else (1.0 - 0.5 * tau[n])
+        psi_bar = psi_in * t1 + (q / sigt) * (1.0 - t1)
+
+        mom[i, :] += _half_moment(leg_pos, w_pos, psi_bar)
+        psi_in = psi_out
+
+    if bc_type == 0:
+        psi_in = psi_out[::-1]
+    elif bc_type == 1:
+        psi_in = right_in_neg.copy()
+    else:
+        psi_in = np.zeros(Nh)
+
+    for i in range(S - 1, -1, -1):
+        sigt = sigt_g[i]
+        q    = src[i, Nh:]
+        tau  = sigt * dx / mu_neg
+        e    = np.exp(-tau)
+
+        psi_out = psi_in * e + (q / sigt) * (1.0 - e)
+
+        t1 = np.empty_like(tau)
+        for n in range(Nh):
+            t1[n] = (1.0 - e[n]) / tau[n] if tau[n] > 1e-12 else (1.0 - 0.5 * tau[n])
+        psi_bar = psi_in * t1 + (q / sigt) * (1.0 - t1)
+
+        mom[i, :] += _half_moment(leg_neg, w_neg, psi_bar)
+        psi_in = psi_out
+
+    return mom
+
+@njit(parallel=True, fastmath=True)
+def _outer_iteration_parallel(flux_prev, sigt_sec, scatter_mats_sec, sigma_f, chi_sec,
+                              prod_mask, dx, mu, w, leg_full,
+                              bc_type, left_in_pos, right_in_neg,
+                              theta_relax, max_inner, eps_inner,nu_over_k):
+    S, L, G = flux_prev.shape
+    N = mu.size
+    Nh = N // 2
+
+    mu_pos = np.abs(mu[:Nh]); mu_neg = np.abs(mu[Nh:])
+    w_pos  = w[:Nh];           w_neg  = w[Nh:]
+    leg_pos = leg_full[:, :Nh]
+    leg_neg = leg_full[:, Nh:]
+
+    prod_rate = np.zeros(S)
+    for s in prange(S):
+        acc = 0.0
+        for g in range(G):
+            acc += sigma_f[g] * flux_prev[s, 0, g]
+        prod_rate[s] = nu_over_k * acc * prod_mask[s]
+
+    g2g_amp = np.zeros((S, G, L))
+    for s in prange(S):
+        for g in range(G):
+            for l in range(L):
+                acc = 0.0
+                for gp in range(G):
+                    if gp != g:
+                        acc += scatter_mats_sec[l, s, gp, g] * flux_prev[s, l, gp]
+                g2g_amp[s, g, l] = acc
+
+    sig_diag = np.zeros((L, S, G))
+    for l in prange(L):
+        for s in range(S):
+            for g in range(G):
+                sig_diag[l, s, g] = scatter_mats_sec[l, s, g, g]
+
+    flux_next = np.zeros_like(flux_prev)
+
+    for g in prange(G):
+        group_mom = flux_prev[:, :, g].copy()
+        prev_mom  = group_mom.copy()
+
+        for _ in range(max_inner):
+            total_src = np.zeros((S, N))
+
+            for s in range(S):
+                amp = prod_rate[s] * chi_sec[s, g]
+                for n in range(N):
+                    total_src[s, n] += amp
+
+            for l in range(L):
+                coeff = 0.5 * (2 * l + 1)
+                for s in range(S):
+                    amp = coeff * (sig_diag[l, s, g] * group_mom[s, l] + g2g_amp[s, g, l])
+                    for n in range(N):
+                        total_src[s, n] += amp * leg_full[l, n]
+
+            sigt_g = sigt_sec[:, g]
+            new_mom = _sweep_sc_one_group(sigt_g, dx, mu_pos, mu_neg, total_src,
+                                          leg_pos, leg_neg, w_pos, w_neg,
+                                          bc_type, left_in_pos, right_in_neg)
+
+            num = 0.0; den = 0.0
+            for s in range(S):
+                for l in range(L):
+                    d = new_mom[s, l] - prev_mom[s, l]
+                    num += d * d
+                    den += prev_mom[s, l] * prev_mom[s, l]
+            l2 = np.sqrt(num / (den + 1e-30))
+
+            for s in range(S):
+                for l in range(L):
+                    group_mom[s, l] = theta_relax * new_mom[s, l] + (1.0 - theta_relax) * group_mom[s, l]
+            prev_mom[:, :] = new_mom
+
+            if l2 < eps_inner:
+                break
+
+        flux_next[:, :, g] = group_mom
+
+    fsum = 0.0
+    for s in range(S):
+        fsum += prod_rate[s]
+        
+    return flux_next, fsum
+
+class Sn:
+    def __init__(self, num_ords, num_groups, num_nodes, NH, dx, bc_type="reflecting"):
+        self.num_ordinates = int(num_ords)
+        assert self.num_ordinates % 2 == 0
+        self.num_groups = int(num_groups)
+        self.num_nodes = int(num_nodes)
+        self.dx = float(dx)
+        self.tol = 1e-6
+
+        assert abs(1.0/self.dx - int(1.0/self.dx)) < self.tol
+        self.sections_per_cell = int(round(1.0/self.dx))
+        self.num_sections = self.num_nodes * self.sections_per_cell
+        self.section_index_to_cell = (np.arange(self.num_sections) // self.sections_per_cell).astype(int)
+
+        self.AH, self.AU = 1, 238
+        self.NH, self.NU = float(NH), 1.0
+
+        self.E0, self.Emin = 1e6, 1.0
+        self.nbins = self.num_groups + 1
+        self.boundaries = None
+        self.Evec = None
+
+        self.nu = 2.43
+        self.bc_type = bc_type
         self.data_dir = "./data/"
-        self.NH = NH
-        self.E0 = 1e6
-        self.Emin = 1
-        #self.E0 = 1e7
-        #self.Emin = 1e-2
-        self.nbins = num_groups + 1
+
         self.leg_order = 4
-        self.AH = 1
-        self.NH = NH
-        self.AU = 238
-        self.NU = 1
-        self.dx = dx
-        self.tol = 1e-8
-        assert np.abs(1/self.dx-int(1/self.dx)) < self.tol #each cell must be evenly split
+        self.legendre = np.zeros((self.leg_order, self.num_ordinates))
+        x, w = leggauss(self.num_ordinates)
+        self.weight = np.flip(w)
+        self.mu = np.flip(x)
+        self._build_legendre_matrix()
 
-        chi35 = pd.read_csv(f'{self.data_dir}chi_u235.txt', sep = '\t',header = 0)
-        H1 = pd.read_csv(f'{self.data_dir}xs_h1_T293k.txt', sep  = '\t', header = 0)
-        U238 = pd.read_csv(f'{self.data_dir}xs_u238_T293k.txt',sep  = '\t', header = 0)
-        sigma_f = pd.read_csv(f'{self.data_dir}xs_u238_fission.csv', sep = ',', dtype=float).to_numpy()
+        self.sig_t_H = None; self.sig_s0_H = None
+        self.sig_t_U = None; self.sig_s0_U = None
+        self.sigma_f = None
+        self.chi = None
 
-        chi = np.array([chi35['E'],chi35['chi']]).T
-        H = np.array([H1['E'],H1['sigma_t'],H1['sigma_s']]).T
-        XS38 = np.array([U238['E'],U238['sigma_t'],U238['sigma_s']]).T
-        chi = self.get_data(chi,self.nbins)
-        H = self.get_data(H,self.nbins)
-        H *= self.NH
-        XS38 = self.get_data(XS38,self.nbins)
-        self.chi = chi[:,1]
-        self.boundaries = XS38[:,0]
-        self.Evec = self.E0 * np.exp(-self.boundaries)
-        self.sig_t_U = XS38[:,1]
-        self.sig_s0_U = XS38[:,2]
-        self.sig_t_H = H[:,1]
-        self.sig_s0_H = H[:,2]
-        self.sigma_f = self.get_data(sigma_f,self.nbins)[:,1]
+        self.xsH_gtg = None
+        self.xsU_gtg = None
 
-        self.xs_gtg_p0_U = None
-        self.xs_gtg_p1_U = None
-        self.xs_gtg_p2_U = None
-        self.xs_gtg_p3_U = None
+        self.sigt_sec = None
+        self.scatter_mats_sec = None
 
-        self.xs_gtg_p0_H = None
-        self.xs_gtg_p1_H = None
-        self.xs_gtg_p2_H = None
-        self.xs_gtg_p3_H = None
+        self._load_or_build_data()
+        self.build_geometry(seed=10, p_U=0.5, verbose=True)
 
-    def get_data(self,data, gridpoints):
-        data = data[(data[:, 0] <= self.E0) & (data[:, 0] >= self.Emin)]
-        data[:, 0] = np.log(self.E0 / data[:, 0])
+    @staticmethod
+    def _safe_load_csv(path, sep, cols=None):
+        df = pd.read_csv(path, sep=sep, header=0)
+        if cols is not None:
+            try:
+                df = df.loc[:, cols]
+            except Exception:
+                pass
+        return df.to_numpy(dtype=float)
 
-        # Sort
-        sort_idx = np.argsort(data[:, 0])
-        data = data[sort_idx]
-        new_grid = np.linspace(np.log(self.E0/self.E0), np.log(self.E0 / self.Emin), gridpoints)
+    @staticmethod
+    def get_data(data, gridpoints, E0, Emin):
+        data = data[(data[:, 0] <= E0) & (data[:, 0] >= Emin)].copy()
+        data[:, 0] = np.log(E0 / data[:, 0])
+        data = data[np.argsort(data[:, 0])]
+        new_grid = np.linspace(np.log(E0/E0), np.log(E0/Emin), gridpoints)
         out = np.empty((new_grid.size, data.shape[1]), dtype=float)
         out[:, 0] = new_grid
-
         xp = data[:, 0]
-        for i in range(1, data.shape[1]): out[:, i] = np.interp(new_grid, xp, data[:, i])
+        for i in range(1, data.shape[1]):
+            out[:, i] = np.interp(new_grid, xp, data[:, i])
         return out
 
-    def group_bound(self, A, g, lga): return (self.boundaries.size if A == 1
-                else np.searchsorted(self.boundaries, self.boundaries[g] + lga))
-                #else 1 + np.searchsorted(self.boundaries, self.boundaries[g] + lga))
+    def _load_or_build_data(self):
+        chi35 = self._safe_load_csv(f'{self.data_dir}chi_u235.txt', '\t', cols=['E','chi'])
+        H1   = self._safe_load_csv(f'{self.data_dir}xs_h1_T293k.txt', '\t', cols=['E','sigma_t','sigma_s'])
+        U238 = self._safe_load_csv(f'{self.data_dir}xs_u238_T293k.txt', '\t', cols=['E','sigma_t','sigma_s'])
+        sigma_f_raw = self._safe_load_csv(f'{self.data_dir}xs_u238_fission.csv', ',', cols=None)
 
-    def gmax_vec_fn(self, A, lga):
-        gmax_vec = np.zeros_like(self.boundaries, dtype = int)
-        for g in range(self.boundaries.size): gmax_vec[g] = self.group_bound(A,g,lga)
+        chi = self.get_data(chi35, self.nbins, self.E0, self.Emin)
+        H   = self.get_data(H1,   self.nbins, self.E0, self.Emin)
+        U   = self.get_data(U238, self.nbins, self.E0, self.Emin)
+
+        self.boundaries = U[:, 0]
+        self.Evec = self.E0 * np.exp(-self.boundaries)
+
+        self.sig_t_H  = H[:-1, 1] * self.NH
+        self.sig_s0_H = H[:-1, 2] * self.NH
+        self.sig_t_U  = U[:-1, 1] * self.NU
+        self.sig_s0_U = U[:-1, 2] * self.NU
+
+        self.chi = chi[:-1, 1]
+        s = self.chi.sum()
+        if s > 0: self.chi /= s
+
+        if sigma_f_raw is not None and sigma_f_raw.shape[1] >= 2:
+            self.sigma_f = self.get_data(sigma_f_raw, self.nbins, self.E0, self.Emin)[:-1, 1]
+        else:
+            self.sigma_f = np.zeros(self.num_groups)
+
+        self.xsH_gtg = self._build_sigma_gtg(self.AH, self.sig_s0_H)
+        self.xsU_gtg = self._build_sigma_gtg(self.AU, self.sig_s0_U)
+
+    def _build_sigma_gtg(self, A, sig_s0):
+        gmax_vec = self._gmax_vec_fn(A, self._lga_fn(self._alpha_fn(A)))
+        return self._gen_sig_sn_gtg(A, sig_s0, self.leg_order, self.boundaries, gmax_vec,
+                                    self._alpha_fn(A), self.tol)
+
+    def build_geometry(self, layout=None, p_U=0.5, seed=10, verbose=True):
+        if layout is not None:
+            arr = np.asarray(layout, dtype=int)
+            assert arr.shape == (self.num_nodes,)
+            assert np.all((arr == 0) | (arr == 1))
+            self.cell_layout = arr.copy()
+        else:
+            rng = np.random.default_rng(seed=seed)
+            self.cell_layout = (rng.random(self.num_nodes) < float(p_U)).astype(int)
+
+        self.mat_per_section = np.repeat(self.cell_layout, self.sections_per_cell)
+        if verbose:
+            print(f"Geometry (cells) 0=H,1=U: {self.cell_layout}")
+            print(f"Number of Uranium Cells: {sum(self.cell_layout)}")
+        self._build_per_section_xs_from_layout()
+
+    def _build_per_section_xs_from_layout(self):
+        S, G = self.num_sections, self.num_groups
+        self.sigt_sec = np.zeros((S, G))
+        self.scatter_mats_sec = np.zeros((self.leg_order, S, G, G))
+        for s in range(S):
+            if self.mat_per_section[s] == 0:
+                self.sigt_sec[s, :] = self.sig_t_H
+                self.scatter_mats_sec[:, s, :, :] = self.xsH_gtg
+            else:
+                self.sigt_sec[s, :] = self.sig_t_U
+                self.scatter_mats_sec[:, s, :, :] = self.xsU_gtg
+
+    def _build_legendre_matrix(self):
+        for l in range(self.leg_order):
+            self.legendre[l, :] = lpmv(0, l, self.mu)
+
+    @staticmethod
+    def _alpha_fn(A): return ((A - 1.0) / (A + 1.0)) ** 2
+    @staticmethod
+    def _lga_fn(alpha): return -np.log(alpha) if alpha != 0 else np.inf
+
+    def _group_bound(self, A, g, lga):
+        if A == 1.0:
+            return self.boundaries.size
+        return int(np.searchsorted(self.boundaries, self.boundaries[g] + lga))
+
+    def _gmax_vec_fn(self, A, lga):
+        G = self.boundaries.size
+        gmax_vec = np.zeros(G, dtype=np.int64)
+        for g in range(G):
+            gmax_vec[g] = self._group_bound(A, g, lga)
         return gmax_vec
-
-    def sigma_gtg_generator(self):
-        sigma = self.gen_sig_sn_gtg(self.AU,self.sig_s0_U,self.leg_order, self.boundaries,
-                                        self.gmax_vec_fn(self.AU,self.lga_fn(self.alpha_fn(self.AU))),
-                                        self.alpha_fn(self.AU), self.tol)
-        self.xs_gtg_p0_U = sigma[0,:,:]
-        self.xs_gtg_p1_U = sigma[1,:,:]
-        self.xs_gtg_p2_U = sigma[2,:,:]
-        self.xs_gtg_p3_U = sigma[3,:,:]
-
-        sigma = self.gen_sig_sn_gtg(self.AH,self.sig_s0_H,self.leg_order, self.boundaries,
-                                        self.gmax_vec_fn(self.AH,self.lga_fn(self.alpha_fn(self.AH))),
-                                        self.alpha_fn(self.AH), self.tol)
-        self.xs_gtg_p0_H = sigma[0,:,:]
-        self.xs_gtg_p1_H = sigma[1,:,:]
-        self.xs_gtg_p2_H = sigma[2,:,:]
-        self.xs_gtg_p3_H = sigma[3,:,:]
-
-    @staticmethod
-    def alpha_fn(A): return ((A - 1.0)/(A + 1.0)) ** 2
-
-    @staticmethod
-    def lga_fn(alpha): return -np.log(alpha) if alpha != 0 else np.inf
 
     @staticmethod
     @njit(parallel=True, fastmath=True)
-    def gen_sig_sn_gtg(A, sig_s0, order, boundaries, gmax_vec, alpha, tol, n_sub = 8):
-        """Parallel midpoint integration (no SciPy quad).
-        Integrates over x in [c, x2] using n_sub midpoints per base-bin."""
+    def _gen_sig_sn_gtg(A, sig_s0, order, boundaries, gmax_vec, alpha, tol, n_sub=8):
         G = boundaries.size
         du = boundaries[1] - boundaries[0]
         den = (1 - alpha) * du
         lga = -np.log(alpha) if A != 1 else np.inf
         sigma_gtg = np.zeros((order, G - 1, G - 1))
-        Am1 = A-1
-        Ap1 = A+1
+        Am1 = A - 1.0
+        Ap1 = A + 1.0
 
         for l in range(order):
             for gp in prange(G - 1):
                 x1 = boundaries[gp]
-                x2 = boundaries[gp+1]
+                x2 = boundaries[gp + 1]
 
-                for g in range(gp, min(gmax_vec[gp], G-1)):
+                gmax = gmax_vec[gp] if gmax_vec[gp] < G else (G - 1)
+                for g in range(gp, gmax):
                     y1 = boundaries[g]
                     y2 = boundaries[g + 1]
-                    c = max(x1, y1 - lga)
+                    c = x1 if x1 > (y1 - lga) else (y1 - lga)
 
-                    if (y1 < x1) or (c >= x2) or den == 0.0: continue
+                    if (y1 < x1) or (c >= x2) or den == 0.0:
+                        continue
 
-                    # choose number of midpoint samples
                     length = x2 - c
                     n_steps_base = int(np.ceil(length / du))
-                    if n_steps_base < 1: n_steps_base = 1
+                    if n_steps_base < 1:
+                        n_steps_base = 1
                     n_steps = n_steps_base * n_sub
                     dx = length / n_steps
 
-                    # integrate
-                    acc = 0
+                    acc = 0.0
                     for s in range(n_steps):
-                        xm = c + (s + .5) * dx
+                        xm = c + (s + 0.5) * dx
                         a = y1 if xm < y1 else xm
                         bx = xm + lga
                         b = y2 if bx > y2 else bx
 
-                        if l == 0: val = np.exp(-(a - xm)) - np.exp(-(b - xm))
-
+                        if l == 0:
+                            val = np.exp(-(a - xm)) - np.exp(-(b - xm))
                         elif l == 1:
-                            if A == 1:
-                                val = ((Ap1) / 3) * (np.exp(1.5 * (xm - a)) - np.exp(1.5 * (xm - b)))
+                            if A == 1.0:
+                                val = (Ap1 / 3.0) * (np.exp(1.5 * (xm - a)) - np.exp(1.5 * (xm - b)))
                             else:
-                                val = (((Ap1) / 3) * (np.exp(1.5 * (xm - a)) - np.exp(1.5 * (xm - b)))
-                                  - (Am1) * (np.exp(.5 * (xm - a)) - np.exp(.5 * (xm - b))))
-
-
+                                val = ((Ap1 / 3.0) * (np.exp(1.5 * (xm - a)) - np.exp(1.5 * (xm - b)))
+                                       - (Am1) * (np.exp(0.5 * (xm - a)) - np.exp(0.5 * (xm - b))))
                         elif l == 2:
-                            if A == 1:
-                                val = .0625 * ((np.exp(xm - 2*a - b) - np.exp(xm - a - 2*b)) *
-                                (-4*(3*A*A - 1)*np.exp(a+b) + (3*Ap1*Ap1*(np.exp(a+xm)+np.exp(b+xm)))))
+                            if A == 1.0:
+                                val = 0.0625 * ((np.exp(xm - 2 * a - b) - np.exp(xm - a - 2 * b)) *
+                                                (-4.0 * (3.0 * A * A - 1.0) * np.exp(a + b)
+                                                 + (3.0 * Ap1 * Ap1 * (np.exp(a + xm) + np.exp(b + xm)))))
                             else:
-                                val = .0625 * (6 * Am1 *  Am1 * (b-a)
-                                + (np.exp(xm - 2*a - b) - np.exp(xm - a - 2*b)) *
-                                (-4*(3*A*A - 1)*np.exp(a+b) + (3*Ap1*Ap1 * (np.exp(a+xm)+np.exp(b+xm)))))
-
+                                val = 0.0625 * (6.0 * Am1 * Am1 * (b - a)
+                                                + (np.exp(xm - 2 * a - b) - np.exp(xm - a - 2 * b)) *
+                                                (-4.0 * (3.0 * A * A - 1.0) * np.exp(a + b)
+                                                 + (3.0 * Ap1 * Ap1 * (np.exp(a + xm) + np.exp(b + xm)))))
                         else:
-                            if A == 1:
+                            if A == 1.0:
                                 val = 0.0625 * (
-                                  + 2*(Ap1*Ap1*Ap1) * (np.exp(2.5*(xm - a)) - np.exp(2.5*(xm - b)))
-                                  - 2*(Ap1)*(5*A*A - 1) * (np.exp(1.5*(xm - a)) - np.exp(1.5*(xm - b))))
+                                    2.0 * (Ap1 * Ap1 * Ap1) * (np.exp(2.5 * (xm - a)) - np.exp(2.5 * (xm - b)))
+                                    - 2.0 * (Ap1) * (5.0 * A * A - 1.0) * (np.exp(1.5 * (xm - a)) - np.exp(1.5 * (xm - b)))
+                                )
                             else:
                                 val = 0.0625 * (
-                                    10*(Am1*Am1*Am1) * (np.exp(.5*(a - xm)) - np.exp(.5*(b - xm)))
-                                  + 2*(Ap1*Ap1*Ap1) * (np.exp(2.5*(xm - a)) - np.exp(2.5*(xm - b)))
-                                  + 6*(Am1)*(5*A*A - 1) * (np.exp(.5*(xm - a)) - np.exp(.5*(xm - b)))
-                                  - 2*(Ap1)*(5*A*A - 1) * (np.exp(1.5*(xm - a)) - np.exp(1.5*(xm - b))))
+                                    10.0 * (Am1 * Am1 * Am1) * (np.exp(0.5 * (a - xm)) - np.exp(0.5 * (b - xm)))
+                                    + 2.0 * (Ap1 * Ap1 * Ap1) * (np.exp(2.5 * (xm - a)) - np.exp(2.5 * (xm - b)))
+                                    + 6.0 * (Am1) * (5.0 * A * A - 1.0) * (np.exp(0.5 * (xm - a)) - np.exp(0.5 * (xm - b)))
+                                    - 2.0 * (Ap1) * (5.0 * A * A - 1.0) * (np.exp(1.5 * (xm - a)) - np.exp(1.5 * (xm - b)))
+                                )
 
                         acc += val
 
-                    sigma_gtg[l, gp, g] = (sig_s0[gp] * acc * dx ) / den
-
-                    if np.abs(sigma_gtg[l,gp,g]) < tol: break
+                    sigma_gtg[l, gp, g] = (sig_s0[gp] * acc * dx) / den
+                    if abs(sigma_gtg[l, gp, g]) < tol:
+                        break
 
         return sigma_gtg
 
+    def moments_to_flux(self, flux_moments):
+        L = self.leg_order
+        coeff = (2*np.arange(L)+1)/2.0
+        return (flux_moments * coeff[None, :]) @ self.legendre
 
+    def flux_to_moments(self, phi, direction):
+        if direction == 1:
+            leg = self.legendre[:, :self.num_ordinates//2]
+            w = self.weight[:self.num_ordinates//2]
+        else:
+            leg = self.legendre[:, self.num_ordinates//2:]
+            w = self.weight[self.num_ordinates//2:]
+        return leg @ (w * phi)
 
-sn = Sn(16,8,32,5,.5)
+    def _build_chi_per_section(self):
+        if not hasattr(self, "mat_per_section"):
+            raise RuntimeError("Call build_geometry() first.")
+    
+        S, G = self.num_sections, self.num_groups
+        chi_sec = np.zeros((S, G), dtype=np.float64)
+    
+        chi_vec = np.array(self.chi, dtype=np.float64).ravel()
+        if chi_vec.size != G or chi_vec.sum() <= 0:
+            chi_vec = np.zeros(G, dtype=np.float64); chi_vec[0] = 1.0
+        else:
+            chi_vec /= chi_vec.sum()
+    
+        chi_sec[self.mat_per_section == 1, :] = chi_vec[None, :]
+        return chi_sec
 
-num_ordinates = 16
-dx = 0.5
-assert np.abs(1/dx-int(1/dx)) < 1e-6 #each cell must be evenly split
-data_dir  = "C:/Users/abrah/Downloads"
-data_path = os.path.join(data_dir, "xs_coarse_lattice.csv")
-data = np.array(pd.read_csv(data_path))
-cell_index = data[:,0]
-groups = data[:,1]
-num_groups = round(groups[-1])
-num_cells = round(cell_index[-1])
-total_xs = data[:,2]
-total_xs = np.reshape(total_xs,(num_cells, num_groups))
-scatter_xs = data[:,3]
-scatter_xs = np.reshape(scatter_xs,(num_cells, num_groups))
-fission_abs_xs = data[:,4]
-fission_abs_xs = np.reshape(fission_abs_xs,(num_cells, num_groups))
-#since fission neutrons are only deposited in group 0, we can get rid of the data for other groups, it's all 0. 
-fission_prod_xs = data[::8,5]
-#rearrange to be in terms of dx rather than cell number for ease of use in calculating fission source
-fission_prod_xs = np.repeat(fission_prod_xs, round(1/dx))
-g2g_p0_scatter_xs = data[:,6:14]
-g2g_p0_scatter_xs = np.reshape(g2g_p0_scatter_xs,(num_cells, num_groups, num_groups))
-#form [cell num, current group, group scattered into]
-g2g_p1_scatter_xs = data[:,14:]
-g2g_p1_scatter_xs = np.reshape(g2g_p1_scatter_xs,(num_cells, num_groups, num_groups))
+    def in_group_scatter_expansion(self, group_flux_moments, g):
+        S, N = self.num_sections, self.num_ordinates
+        src = np.zeros((S, N))
+        for l in range(self.leg_order):
+            sig_ll = self.scatter_mats_sec[l, :, g, g]
+            term = ((2*l+1)/2.0) * (sig_ll * group_flux_moments[:, l])
+            src += term[:, None] * self.legendre[l, :][None, :]
+        return src
 
-scatter_matrices = np.stack((g2g_p0_scatter_xs, g2g_p1_scatter_xs), axis = 0)
+    def g2g_scatter_expansion(self, flux_moments, g):
+        S, N = self.num_sections, self.num_ordinates
+        src = np.zeros((S, N))
+        for l in range(self.leg_order):
+            sig_mat = self.scatter_mats_sec[l, :, :, :]
+            col_g = sig_mat[:, :, g]
+            contrib = np.sum(col_g * flux_moments[:, l, :], axis=1) - col_g[:, g] * flux_moments[:, l, g]
+            src += ((2*l+1)/2.0) * contrib[:, None] * self.legendre[l, :][None, :]
+        return src
 
-neutrons_per_fission = 2.5
-num_sections = round(num_cells/dx)
-cell_indices = np.floor(np.arange(num_sections)*dx).astype(int)
-order = 2 #actually this is order+1, but i don't feel like putting a +1 everywhere.
-weight = np.array([0.1894506104550685, 0.1826034150449236, 0.1691565193950025, 0.1495959888165767,
-          0.1246289712555339, 0.0951585116824928, 0.0622535239386479, 0.0271524594117541])
+    @staticmethod
+    def converged(prev, curr, label=None, eps=1e-6):
+        if prev is None:
+            return False
+        diff = np.linalg.norm(curr - prev)
+        norm = np.linalg.norm(prev)
+        l2 = diff / (norm + 1e-12)
+        if label:
+            print(f"{label} L2: {l2:.3e}")
+        return l2 < eps
 
-#define the gauss-legendre quadrature points
-quadrature_points = np.array([0.0950125098376374, 0.2816035507792589, 0.4580167776572274, 0.6178762444026438, 
-               0.7554044083550030, 0.8656312023878318, 0.9445750230732326, 0.9894009349916499,
-               -0.0950125098376374, -0.2816035507792589, -0.4580167776572274, -0.6178762444026438, 
-               -0.7554044083550030, -0.8656312023878318, -0.9445750230732326, -0.9894009349916499,])
+    def run_parallel(self, max_outer=40, alpha_underrelax=0.7, eps_outer=1e-6,
+                     theta_relax=0.6, max_inner=60, eps_inner=5e-4):
+        S, G, L = self.num_sections, self.num_groups, self.leg_order
+        N = self.num_ordinates
 
- #precalculate the legendre polynomials for the quadrature up to the desired order
-#this code assumes that all scattering and flux moments are given to the same order
-legendre = np.zeros((order, num_ordinates))
-for l in range(order):
-    for n in range(num_ordinates):
-        legendre[l, n] = lpmv(0, l, quadrature_points[n])
+        chi_sec = self._build_chi_per_section()
+        prod_mask = (self.mat_per_section == 1).astype(np.float64)
 
-@njit
-def in_group_scatter_expansion(group_flux_moments,g):
-    source = np.zeros((num_sections, num_ordinates))
-    for l in range(order):
-        source+=((2*l+1)/2)*np.outer(scatter_matrices[l,cell_indices,g,g]*group_flux_moments[:, l],legendre[l,:])
-    return source
+        Nh = N // 2
+        if self.bc_type == "fixed":
+            left_in = self.moments_to_flux(np.asarray([0.1] + [0.0]*(L-1))[None, :])[0, :Nh]
+            right_in = self.moments_to_flux(np.asarray([0.1] + [0.0]*(L-1))[None, :])[0, Nh:]
+        else:
+            left_in = np.zeros(Nh)
+            right_in = np.zeros(Nh)
 
-@njit
-def g2g_scatter_expansion(flux_moments, group_scattered_into):
-    source = np.zeros((num_sections, num_ordinates))
-    exclude_current_group = np.ones(num_groups)
-    exclude_current_group[group_scattered_into] = 0
-    for l in range(order):
-        outscatter_rate = np.zeros(num_sections)
-        for i in range(num_sections):
-            outscatter_rate[i] = np.sum(scatter_matrices[l,cell_indices[i],:,group_scattered_into]*flux_moments[i, l, :]*exclude_current_group)
-        source+=((2*l+1)/2)*np.outer(outscatter_rate , legendre[l,:]) 
-    return source
+        bc_map = {"reflecting": 0, "fixed": 1, "vacuum": 2}
+        bc_code = bc_map[self.bc_type]
 
-def converged(flux_m, flux_m_plus_1, loop):
-    if flux_m is None:
-        return False
-    diff = np.linalg.norm(flux_m_plus_1 - flux_m)
-    norm = np.linalg.norm(flux_m)
-    E = 1e-5#1e-6
-    l2 = diff / (norm+1e-12)#1e-12 prevents divide by 0
-    if loop:
-        print("L2,",loop, l2)
+        sigt_sec = self.sigt_sec.astype(np.float64)
+        scat = self.scatter_mats_sec.astype(np.float64)
+        leg_full = self.legendre.astype(np.float64)
+        mu = self.mu.astype(np.float64)
+        w = self.weight.astype(np.float64)
+        chi_sec = chi_sec.astype(np.float64)
+        prod_mask = prod_mask.astype(np.float64)
+        sigma_f = self.sigma_f.astype(np.float64)
+        dx = float(self.dx)
 
-    return l2 < E
+        flux = np.zeros((S, L, G), dtype=np.float64)
+        flux[:, 0, :] = 1e-2
 
-#reconstruct the flux by evaluating the legendre series at each ordinate
-@njit
-def moments_to_flux(flux_moments):
-    weighted_moments = (2*np.arange(order)+1)/2*flux_moments
-    angular_flux = weighted_moments @ legendre
-    return angular_flux
+        k = 1.0
+        prev_fsum = None
 
-#decontruct the flux into its legendre moments - should only be used on a partial flux, hence only direction 1 or -1
-@njit
-def flux_to_moments(angular_flux, direction):
-    weighted_flux = weight*angular_flux
-    if direction == 1: #mu > 0
-        flux_moments = legendre[:,:num_ordinates//2].copy() @ weighted_flux
-    elif direction == -1: #mu < 0
-        flux_moments = legendre[:,num_ordinates//2:].copy() @ weighted_flux
-    return flux_moments 
+        for it in range(max_outer):
+            nu_over_k = self.nu / max(k, 1e-30)
+            flux_new, fsum = _outer_iteration_parallel(
+                flux, sigt_sec, scat, sigma_f, chi_sec, prod_mask, dx, mu, w, leg_full,
+                bc_code, left_in, right_in, theta_relax, max_inner, eps_inner, nu_over_k
+            )
 
-prev_fission_source, prev_g2g_source = None, None
+            if prev_fsum is not None and prev_fsum > 0.0:
+                k_new = k * (fsum / prev_fsum)
+                k = alpha_underrelax * k_new + (1.0 - alpha_underrelax) * k
+            prev_fsum = fsum
 
-bc_type = "reflecting" #options are fixed, reflecting, and vacuum
-reflecting = True
-incoming_moments_l = np.array([0.1,0]) #for constant bc, this is a given. For reflecting BC, this is a guess
-incoming_moments_r = np.array([0.1,0]) #only used for the case of constant bc
-in_group_source = np.ones((num_sections, num_ordinates, num_groups))*0.01 #initial guess
-g2g_source = np.ones((num_sections, num_ordinates, num_groups))*0.01#initial guess, source is summed over all incoming groups
-fission_source = np.ones((num_sections, num_ordinates, num_groups))*0.01 #initial guess
-flux_moments = np.zeros((num_sections, order, num_groups))
-flux_moments[:, 0, :] = 0.01 #initial guess
+            num = np.linalg.norm(flux_new - flux)
+            den = np.linalg.norm(flux) + 1e-30
+            l2 = num / den
+            print(f"[outer {it}] L2={l2:.3e}, k≈{k:.6f}")
+            flux = flux_new
+            if l2 < eps_outer: break
 
-left_edge_cell_flux = moments_to_flux(incoming_moments_l)[:num_ordinates//2] #initial guess if reflecting
-k=1 #initial guess
+        return flux, k
 
-@njit
-def transport_sweep(group, group_source, left_edge_cell_flux):
-    group_flux_moments = np.zeros((num_sections, order))
-# 	loop over spatial zones from left boundary to right boundary:
-    for i in range(num_sections): 
-        section_index = int(np.floor(i*dx))
-    # 	loop over rightward ordinates, these have mu > 0:
-        current_cell_avg_flux = np.zeros(num_ordinates//2)
-        right_edge_cell_flux = np.zeros(num_ordinates//2)
-# 		solve for the cell-average angular flux using inward flux
-        current_cell_avg_flux = (1+(total_xs[section_index,group]*dx)/(2*np.abs(quadrature_points[:num_ordinates//2])))**-1\
-            *(left_edge_cell_flux+dx*group_source[i,:num_ordinates//2]/(2*np.abs(quadrature_points[:num_ordinates//2])))
-    # 	solve for the outgoing cell-edge angular flux
-        right_edge_cell_flux = 2*current_cell_avg_flux - left_edge_cell_flux
-# 		if outgoing cell-edge flux negative:
-        if np.any(right_edge_cell_flux < 0):
-# 			set outgoing cell-edge flux to zero
-            right_edge_cell_flux = np.where(right_edge_cell_flux<0, 0, right_edge_cell_flux)
-    # 		recompute cell-average angular flux from particle balance
-            current_cell_avg_flux = group_source[i,:num_ordinates//2]/total_xs[section_index,group]\
-                +np.abs(quadrature_points[:num_ordinates//2])*left_edge_cell_flux/(total_xs[section_index,group]*dx)
-        left_edge_cell_flux = right_edge_cell_flux
-        group_flux_moments[i,:] += flux_to_moments(current_cell_avg_flux,1)
-    # apply reflecting boundary condition to compute inward right angular fluxes
-    if bc_type == "reflecting":
-        right_edge_cell_flux = np.flip(left_edge_cell_flux) 
-    elif bc_type == "fixed":
-        right_edge_cell_flux = moments_to_flux(incoming_moments_r)[num_ordinates//2:]
-    elif bc_type == "vacuum": 
-        right_edge_cell_flux = np.zeros(num_ordinates//2)
-# 	loop over spatial zones from right boundary to left boundary:
-    for i in range(num_sections-1,-1,-1): 
-        section_index = int(np.floor(i*dx))
-    # 	loop over leftward ordinates, these have mu < 0:
-        current_cell_avg_flux = np.zeros(num_ordinates//2)
-    # 	solve for the cell-average angular flux using inward flux
-        current_cell_avg_flux = (1+(total_xs[section_index,group]*dx)/(2*np.abs(quadrature_points[num_ordinates//2:])))**-1\
-            *(right_edge_cell_flux+dx*group_source[i,num_ordinates//2:]/(2*np.abs(quadrature_points[num_ordinates//2:])))                # 			solve for the outgoing cell-edge angular flux
-        left_edge_cell_flux = 2*current_cell_avg_flux - right_edge_cell_flux
-# 		if outgoing cell-edge flux negative:
-        if np.any(left_edge_cell_flux < 0):
-# 			set outgoing cell-edge flux to zero
-            left_edge_cell_flux = np.where(left_edge_cell_flux<0, 0, left_edge_cell_flux)
-        # 	recompute cell-average angular flux from particle balance
-            current_cell_avg_flux = group_source[i,num_ordinates//2:]/total_xs[section_index,group]\
-                +np.abs(quadrature_points[num_ordinates//2:])*right_edge_cell_flux/(total_xs[section_index,group]*dx)
-        right_edge_cell_flux = left_edge_cell_flux
-        group_flux_moments[i,:] += flux_to_moments(current_cell_avg_flux,-1)
-# 	apply reflecting boundary condition to compute inward left angular fluxes
-    if bc_type == "reflecting":
-        left_edge_cell_flux = np.flip(right_edge_cell_flux)
-    elif bc_type == "fixed":
-        left_edge_cell_flux = moments_to_flux(incoming_moments_l)[:num_ordinates//2]
-    elif bc_type == "vacuum":
-        left_edge_cell_flux = np.zeros(num_ordinates//2)
-    return (group_flux_moments, left_edge_cell_flux)
-                
+# run
+num_ordinates = 64
+num_groups = 8
+num_nodes = 128
+NH = 5
+dx = 0.1
 
-
-#loop until everything converges
-while not converged(prev_fission_source, fission_source, "outer loop: "): #outer iteration - fission source
-    source = np.zeros((num_sections, num_ordinates, num_groups))
-    if prev_fission_source is not None:
-        k_new = k * np.sum(fission_source)/np.sum(prev_fission_source) #power iteration
-        alpha = 0.7  #arbitrary underrelaxation coefficient to help converge
-        k = alpha * k_new + (1 - alpha) * k
-    prev_fission_source = fission_source.copy()
-    #chi is approximated as only depositing neutrons in the highest energy group, so no need to iterate over groups
-    fission_source = np.zeros((num_sections, num_ordinates, num_groups))
-    fission_term = (1/k)*neutrons_per_fission*fission_prod_xs*flux_moments[:,0,0]
-    fission_source[:,:,0] = np.transpose(np.tile(fission_term,(num_ordinates,1))) #fission source is isotropic, so it's applied to all ordinates
-    while not converged(prev_g2g_source, g2g_source, "middle loop: "): #middle iteration - group to group scattering
-        prev_g2g_source = g2g_source.copy()
-        for group_scattered_into in range(num_groups):
-            g2g_source[:,:,group_scattered_into] = g2g_scatter_expansion(flux_moments, group_scattered_into)
-        for group in range(num_groups):
-            group_flux_moments = np.zeros((num_sections, order))
-            prev_group_flux = None
-            while not converged(prev_group_flux, group_flux_moments, 0): #inner iteration - ingroup scattering and transport sweep
-                prev_group_flux = group_flux_moments.copy()
-                #compute internal source from flux moments
-                in_group_source[:,:,group] = in_group_scatter_expansion(prev_group_flux, group)
-                source[:,:,group] = fission_source[:,:,group]+g2g_source[:,:,group]+in_group_source[:,:,group]
-                group_flux_moments, left_edge_cell_flux = transport_sweep(group,source[:,:,group], left_edge_cell_flux)
-            flux_moments[:,:,group] = group_flux_moments
-
-# report scalar flux in each cell
-#TODO are other quantities of interest? If so, it shouldn't be an issue to plot them as well
-scalar_flux = flux_moments[:,0,:]
-ax = sns.heatmap(np.transpose(scalar_flux), cmap='viridis')
-plt.show()
-print(time.time()-start_time)
+sn = Sn(num_ordinates, num_groups, num_nodes, NH, dx, bc_type="reflecting")
+flux_moments, k_eff = sn.run_parallel()
+scalar_flux = flux_moments[:, 0, :]
+print("k_eff ~", k_eff)
+avg_phi_g = scalar_flux.mean(axis=0)
+print("Avg scalar flux per group:", np.array2string(avg_phi_g, precision=4))
+print("Elapsed:", time.time() - start_time, "s")
