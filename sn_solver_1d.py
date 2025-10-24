@@ -85,7 +85,7 @@ def converged(flux_m, flux_m_plus_1, loop):
         return False
     diff = np.linalg.norm(flux_m_plus_1 - flux_m)
     norm = np.linalg.norm(flux_m)
-    E = 1e-5#1e-6
+    E = 1e-3#1e-6
     l2 = diff / (norm+1e-12)#1e-12 prevents divide by 0
     if loop:
         print("L2,",loop, l2)
@@ -211,8 +211,16 @@ while not converged(prev_fission_source, fission_source, "outer loop: "): #outer
             flux_moments[:,:,group] = group_flux_moments
 
 # report scalar flux in each cell
-#TODO are other quantities of interest? If so, it shouldn't be an issue to plot them as well
 scalar_flux = flux_moments[:,0,:]
+x = np.arange(num_sections)*dx
 ax = sns.heatmap(np.transpose(scalar_flux), cmap='viridis')
+plt.show()
+for g in range(num_groups):
+    plt.plot(x, scalar_flux[:,g], label = f"group {g}")
+plt.title("group scalar fluxes")
+plt.legend()
+plt.show()
+plt.plot(x, np.sum(scalar_flux, axis=1))
+plt.title("overall scalar flux")
 plt.show()
 print(time.time()-start_time)
