@@ -127,7 +127,7 @@ def _outer_iteration_parallel(flux_prev, sigt_sec, scatter_mats_sec, sigma_f, ch
         for _ in range(max_inner):
             total_src = np.zeros((S, N))
 
-            for s in range(S):
+            for s in range(S): #add fission source
                 amp = prod_rate[s] * chi_sec[s, g]
                 for n in range(N):
                     total_src[s, n] += amp

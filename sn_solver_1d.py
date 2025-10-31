@@ -7,18 +7,17 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.special import lpmv
 from numba import njit
+from numpy.polynomial.legendre import leggauss
 print(time.time()-start_time)
-
-#TODO implement vacuum bc
-#TODO Write fixed source as Fourier Expansion
-#random numbers for s2, s3.
 
 num_ordinates = 16
 dx = 0.5
 assert np.abs(1/dx-int(1/dx)) < 1e-6 #each cell must be evenly split
-data_dir  = "C:/Users/abrah/Downloads"
+save_dir = "charts"
+data_dir  = "data"
 data_path = os.path.join(data_dir, "xs_coarse_lattice.csv")
 data = np.array(pd.read_csv(data_path))
+data = data[:736,:]#truncated for speed
 cell_index = data[:,0]
 groups = data[:,1]
 num_groups = round(groups[-1])
@@ -45,14 +44,8 @@ neutrons_per_fission = 2.5
 num_sections = round(num_cells/dx)
 cell_indices = np.floor(np.arange(num_sections)*dx).astype(int)
 order = 2 #actually this is order+1, but i don't feel like putting a +1 everywhere.
-weight = np.array([0.1894506104550685, 0.1826034150449236, 0.1691565193950025, 0.1495959888165767,
-          0.1246289712555339, 0.0951585116824928, 0.0622535239386479, 0.0271524594117541])
 
-#define the gauss-legendre quadrature points
-quadrature_points = np.array([0.0950125098376374, 0.2816035507792589, 0.4580167776572274, 0.6178762444026438, 
-               0.7554044083550030, 0.8656312023878318, 0.9445750230732326, 0.9894009349916499,
-               -0.0950125098376374, -0.2816035507792589, -0.4580167776572274, -0.6178762444026438, 
-               -0.7554044083550030, -0.8656312023878318, -0.9445750230732326, -0.9894009349916499,])
+quadrature_points,weight = leggauss(num_ordinates)
 
  #precalculate the legendre polynomials for the quadrature up to the desired order
 #this code assumes that all scattering and flux moments are given to the same order
@@ -85,7 +78,7 @@ def converged(flux_m, flux_m_plus_1, loop):
         return False
     diff = np.linalg.norm(flux_m_plus_1 - flux_m)
     norm = np.linalg.norm(flux_m)
-    E = 1e-5#1e-6
+    E = 1e-6
     l2 = diff / (norm+1e-12)#1e-12 prevents divide by 0
     if loop:
         print("L2,",loop, l2)
@@ -102,18 +95,19 @@ def moments_to_flux(flux_moments):
 #decontruct the flux into its legendre moments - should only be used on a partial flux, hence only direction 1 or -1
 @njit
 def flux_to_moments(angular_flux, direction):
-    weighted_flux = weight*angular_flux
     if direction == 1: #mu > 0
-        flux_moments = legendre[:,:num_ordinates//2].copy() @ weighted_flux
-    elif direction == -1: #mu < 0
+        weighted_flux = weight[num_ordinates//2:]*angular_flux
         flux_moments = legendre[:,num_ordinates//2:].copy() @ weighted_flux
+    elif direction == -1: #mu < 0
+        weighted_flux = weight[:num_ordinates//2]*angular_flux
+        flux_moments = legendre[:,:num_ordinates//2].copy() @ weighted_flux
     return flux_moments 
 
 prev_fission_source, prev_g2g_source = None, None
 
-bc_type = "reflecting" #options are fixed, reflecting, and vacuum
-reflecting = True
-incoming_moments_l = np.array([0.1,0]) #for constant bc, this is a given. For reflecting BC, this is a guess
+bc_type_r = "reflecting" #options are fixed, reflecting, and vacuum
+bc_type_l = "vacuum"
+incoming_moments_l = np.array([0.1,0]) #for constant bc, this is a given. For reflecting and vacuum BC, this is a guess
 incoming_moments_r = np.array([0.1,0]) #only used for the case of constant bc
 in_group_source = np.ones((num_sections, num_ordinates, num_groups))*0.01 #initial guess
 g2g_source = np.ones((num_sections, num_ordinates, num_groups))*0.01#initial guess, source is summed over all incoming groups
@@ -121,7 +115,7 @@ fission_source = np.ones((num_sections, num_ordinates, num_groups))*0.01 #initia
 flux_moments = np.zeros((num_sections, order, num_groups))
 flux_moments[:, 0, :] = 0.01 #initial guess
 
-left_edge_cell_flux = moments_to_flux(incoming_moments_l)[:num_ordinates//2] #initial guess if reflecting
+left_edge_cell_flux = moments_to_flux(incoming_moments_l)[num_ordinates//2:] #initial guess if reflecting
 k=1 #initial guess
 
 @njit
@@ -134,8 +128,8 @@ def transport_sweep(group, group_source, left_edge_cell_flux):
         current_cell_avg_flux = np.zeros(num_ordinates//2)
         right_edge_cell_flux = np.zeros(num_ordinates//2)
 # 		solve for the cell-average angular flux using inward flux
-        current_cell_avg_flux = (1+(total_xs[section_index,group]*dx)/(2*np.abs(quadrature_points[:num_ordinates//2])))**-1\
-            *(left_edge_cell_flux+dx*group_source[i,:num_ordinates//2]/(2*np.abs(quadrature_points[:num_ordinates//2])))
+        current_cell_avg_flux = (1+(total_xs[section_index,group]*dx)/(2*np.abs(quadrature_points[num_ordinates//2:])))**-1\
+            *(left_edge_cell_flux+dx*group_source[i,num_ordinates//2:]/(2*np.abs(quadrature_points[num_ordinates//2:])))
     # 	solve for the outgoing cell-edge angular flux
         right_edge_cell_flux = 2*current_cell_avg_flux - left_edge_cell_flux
 # 		if outgoing cell-edge flux negative:
@@ -143,16 +137,16 @@ def transport_sweep(group, group_source, left_edge_cell_flux):
 # 			set outgoing cell-edge flux to zero
             right_edge_cell_flux = np.where(right_edge_cell_flux<0, 0, right_edge_cell_flux)
     # 		recompute cell-average angular flux from particle balance
-            current_cell_avg_flux = group_source[i,:num_ordinates//2]/total_xs[section_index,group]\
-                +np.abs(quadrature_points[:num_ordinates//2])*left_edge_cell_flux/(total_xs[section_index,group]*dx)
+            current_cell_avg_flux = group_source[i,num_ordinates//2:]/total_xs[section_index,group]\
+                +np.abs(quadrature_points[num_ordinates//2:])*left_edge_cell_flux/(total_xs[section_index,group]*dx)
         left_edge_cell_flux = right_edge_cell_flux
         group_flux_moments[i,:] += flux_to_moments(current_cell_avg_flux,1)
     # apply reflecting boundary condition to compute inward right angular fluxes
-    if bc_type == "reflecting":
+    if bc_type_r == "reflecting":
         right_edge_cell_flux = np.flip(left_edge_cell_flux) 
-    elif bc_type == "fixed":
-        right_edge_cell_flux = moments_to_flux(incoming_moments_r)[num_ordinates//2:]
-    elif bc_type == "vacuum": 
+    elif bc_type_r == "fixed":
+        right_edge_cell_flux = moments_to_flux(incoming_moments_r)[:num_ordinates//2]
+    elif bc_type_r == "vacuum": 
         right_edge_cell_flux = np.zeros(num_ordinates//2)
 # 	loop over spatial zones from right boundary to left boundary:
     for i in range(num_sections-1,-1,-1): 
@@ -160,24 +154,24 @@ def transport_sweep(group, group_source, left_edge_cell_flux):
     # 	loop over leftward ordinates, these have mu < 0:
         current_cell_avg_flux = np.zeros(num_ordinates//2)
     # 	solve for the cell-average angular flux using inward flux
-        current_cell_avg_flux = (1+(total_xs[section_index,group]*dx)/(2*np.abs(quadrature_points[num_ordinates//2:])))**-1\
-            *(right_edge_cell_flux+dx*group_source[i,num_ordinates//2:]/(2*np.abs(quadrature_points[num_ordinates//2:])))                # 			solve for the outgoing cell-edge angular flux
+        current_cell_avg_flux = (1+(total_xs[section_index,group]*dx)/(2*np.abs(quadrature_points[:num_ordinates//2])))**-1\
+            *(right_edge_cell_flux+dx*group_source[i,:num_ordinates//2]/(2*np.abs(quadrature_points[:num_ordinates//2])))                # 			solve for the outgoing cell-edge angular flux
         left_edge_cell_flux = 2*current_cell_avg_flux - right_edge_cell_flux
 # 		if outgoing cell-edge flux negative:
         if np.any(left_edge_cell_flux < 0):
 # 			set outgoing cell-edge flux to zero
             left_edge_cell_flux = np.where(left_edge_cell_flux<0, 0, left_edge_cell_flux)
         # 	recompute cell-average angular flux from particle balance
-            current_cell_avg_flux = group_source[i,num_ordinates//2:]/total_xs[section_index,group]\
-                +np.abs(quadrature_points[num_ordinates//2:])*right_edge_cell_flux/(total_xs[section_index,group]*dx)
+            current_cell_avg_flux = group_source[i,:num_ordinates//2]/total_xs[section_index,group]\
+                +np.abs(quadrature_points[:num_ordinates//2])*right_edge_cell_flux/(total_xs[section_index,group]*dx)
         right_edge_cell_flux = left_edge_cell_flux
         group_flux_moments[i,:] += flux_to_moments(current_cell_avg_flux,-1)
 # 	apply reflecting boundary condition to compute inward left angular fluxes
-    if bc_type == "reflecting":
+    if bc_type_l == "reflecting":
         left_edge_cell_flux = np.flip(right_edge_cell_flux)
-    elif bc_type == "fixed":
-        left_edge_cell_flux = moments_to_flux(incoming_moments_l)[:num_ordinates//2]
-    elif bc_type == "vacuum":
+    elif bc_type_l == "fixed":
+        left_edge_cell_flux = moments_to_flux(incoming_moments_l)[num_ordinates//2:]
+    elif bc_type_l == "vacuum":
         left_edge_cell_flux = np.zeros(num_ordinates//2)
     return (group_flux_moments, left_edge_cell_flux)
                 
@@ -188,7 +182,7 @@ while not converged(prev_fission_source, fission_source, "outer loop: "): #outer
     source = np.zeros((num_sections, num_ordinates, num_groups))
     if prev_fission_source is not None:
         k_new = k * np.sum(fission_source)/np.sum(prev_fission_source) #power iteration
-        alpha = 0.7  #arbitrary underrelaxation coefficient to help converge
+        alpha = 0.7  #underrelaxation coefficient to help converge
         k = alpha * k_new + (1 - alpha) * k
     prev_fission_source = fission_source.copy()
     #chi is approximated as only depositing neutrons in the highest energy group, so no need to iterate over groups
@@ -211,8 +205,31 @@ while not converged(prev_fission_source, fission_source, "outer loop: "): #outer
             flux_moments[:,:,group] = group_flux_moments
 
 # report scalar flux in each cell
-#TODO are other quantities of interest? If so, it shouldn't be an issue to plot them as well
 scalar_flux = flux_moments[:,0,:]
-ax = sns.heatmap(np.transpose(scalar_flux), cmap='viridis')
-plt.show()
+x = np.arange(num_sections)*dx
+for g in range(num_groups):
+    plt.plot(x, scalar_flux[:,g], label = f"group {g}")
+    plt.xlabel("Cell index")
+    plt.ylabel("Scalar flux")
+    plt.title(f"Group {g} Scalar flux")
+    plt.savefig(f"{save_dir}/phi_g{g}_no_class.png", bbox_inches="tight")
+    plt.cla()
+
+    ang = moments_to_flux(flux_moments[:, :, g])  
+    fig, ax = plt.subplots(figsize=(6, 3.8))
+    im = ax.imshow(ang.T, aspect='auto', origin='lower',
+                   extent=[0, num_sections, -1, 1], interpolation='nearest')
+    ax.set_title(f"Group {g} Angular flux")
+    ax.set_xlabel("Section")
+    ax.set_ylabel("μ")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.set_ylabel("ψ")
+    fig.savefig(f"{save_dir}/psi_g{g}_no_class.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+plt.plot(x, np.sum(scalar_flux, axis=1))
+plt.xlabel("Cell index")
+plt.ylabel("Scalar flux")
+plt.title("Overall scalar flux")
+plt.savefig(f"{save_dir}/phi_total_no_class.png", bbox_inches="tight")
 print(time.time()-start_time)
