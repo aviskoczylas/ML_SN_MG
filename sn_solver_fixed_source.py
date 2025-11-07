@@ -47,8 +47,11 @@ def _project_moments(psi_sn: np.ndarray, leg_w: np.ndarray) -> np.ndarray:
         return out
 
 @njit(fastmath=True)
-def _sweep_sc_one_group(sigt_g, dx, mu_pos, mu_neg, src, leg_pos, leg_neg, w_pos, w_neg, bc_code):
-    def _sweep_response(mu_vec, sigt, dx):
+def _sweep_sc_one_group(sigt_g, dx, mu_pos, mu_neg, src,
+                        leg_pos, leg_neg, w_pos, w_neg,
+                        bc_code,               # 0=reflecting, 1=vacuum, 2=inflow (applies to both ends)
+                        left_in_pos, right_in_neg):  # shape (Nh,), ignored unless inflow
+    def _resp(mu_vec, sigt, dx):
         tau = sigt * dx / mu_vec
         e = np.exp(-tau)
         t1 = np.where(tau > 1e-12, (1.0 - e) / tau, 1.0 - 0.5 * tau)
@@ -58,37 +61,45 @@ def _sweep_sc_one_group(sigt_g, dx, mu_pos, mu_neg, src, leg_pos, leg_neg, w_pos
     L = leg_pos.shape[0]
     Nh = mu_pos.size
     mom = np.zeros((S, L))
-    psi_in = np.zeros(Nh)
 
-    # Forward sweep 
+    # Left boundary for forward sweep (μ>0)
+    if bc_code == 2: psi_in = left_in_pos
+    else: psi_in = np.zeros(Nh)
+
+    # forward sweep
     for i in range(S):
         sigt = sigt_g[i]
         q    = src[i, :Nh]
-        e, t1 = _sweep_response(mu_pos, sigt, dx)
+        e, t1 = _resp(mu_pos, sigt, dx)
         psi_out = psi_in * e + (q / sigt) * (1.0 - e)
         psi_bar = psi_in * t1 + (q / sigt) * (1.0 - t1)
-        mom[i, :] += _half_moment(leg_pos, w_pos, psi_bar)
+        for l in range(L):
+            mom[i, l] += (leg_pos[l, :] * w_pos[:] * psi_bar[:]).sum()
         psi_in = psi_out
 
-    # Set inflow for negative mu at right boundary
-    if bc_code == 0: psi_in = psi_out[::-1]
-    elif bc_code == 1: psi_in = np.zeros(Nh)
+    # Right boundary for backward sweep (μ<0)
+    if bc_code == 2: psi_in = right_in_neg
+    elif bc_code == 0: psi_in = psi_out[::-1]
+    else: psi_in = np.zeros(Nh)
 
-    # Backward sweep 
+    # backward sweep
     for i in range(S - 1, -1, -1):
         sigt = sigt_g[i]
         q    = src[i, Nh:]
-        e, t1 = _sweep_response(mu_neg, sigt, dx)
+        e, t1 = _resp(mu_neg, sigt, dx)
         psi_out = psi_in * e + (q / sigt) * (1.0 - e)
         psi_bar = psi_in * t1 + (q / sigt) * (1.0 - t1)
-        mom[i, :] += _half_moment(leg_neg, w_neg, psi_bar)
+        for l in range(L):
+            mom[i, l] += (leg_neg[l, :] * w_neg[:] * psi_bar[:]).sum()
         psi_in = psi_out
 
     return mom
 
 @njit(parallel=True, fastmath=True, cache=True)
 def _outer_iteration_parallel_fixed(flux_prev, sigt_sec, scatter_mats_sec,
-                                    Qmom, dx, mu, w, leg_full, bc_type, 
+                                    Qmom, dx, mu, w, leg_full,
+                                    bc_code,                    # int
+                                    left_all, right_all,        # (Nh, G) or None
                                     theta_relax, max_inner, eps_inner):
     S, L, G = flux_prev.shape
     N = mu.size
@@ -144,8 +155,18 @@ def _outer_iteration_parallel_fixed(flux_prev, sigt_sec, scatter_mats_sec,
 
             # Sweep this energy group
             sigt_g = sigt_sec[:, g]
-            new_mom = _sweep_sc_one_group(sigt_g, dx, mu_pos, mu_neg, total_src,
-                              leg_pos, leg_neg, w_pos, w_neg, bc_type)
+            # Per-group boundary inflow
+            if bc_code == 2 and left_all is not None: left_in = left_all[:, g]
+            else: left_in = np.zeros(Nh, dtype=np.float64)
+
+            if bc_code == 2 and right_all is not None: right_in = right_all[:, g]
+            else: right_in = np.zeros(Nh, dtype=np.float64)
+
+            new_mom = _sweep_sc_one_group(
+                sigt_g, dx, mu_pos, mu_neg, total_src,
+                leg_pos, leg_neg, w_pos, w_neg,
+                bc_code, left_in, right_in
+            )
 
             # Inner convergence check on group moments
             num = 0.0; den = 0.0
@@ -162,8 +183,7 @@ def _outer_iteration_parallel_fixed(flux_prev, sigt_sec, scatter_mats_sec,
                     group_mom[s, l] = theta_relax * new_mom[s, l] + (1.0 - theta_relax) * group_mom[s, l]
 
             prev_mom[:, :] = new_mom
-            if l2 < eps_inner:
-                break
+            if l2 < eps_inner: break
 
         flux_next[:, :, g] = group_mom
 
@@ -171,7 +191,8 @@ def _outer_iteration_parallel_fixed(flux_prev, sigt_sec, scatter_mats_sec,
 
 def choose_bc_type():
     rn = np.random.rand()
-    if rn < .5: bc_type = "reflecting"
+    if rn < .25: bc_type = "reflecting"
+    elif rn < .75: bc_type = "inflow"
     else: bc_type = "vacuum"
     return bc_type
 
@@ -205,10 +226,9 @@ class Sn:
         self.nu = 2.43
         self.bc_type = bc_type.lower()
 
-        # optional: moments; you may keep them different per side if desired
-        self.bc_left_moments  = None   # (L_src, G) or None
-        self.bc_right_moments = None   # (L_src, G) or None
-        self.bc_left_inflow   = None   # cached (Nh, G)
+        self.bc_left_moments  = None   
+        self.bc_right_moments = None   
+        self.bc_left_inflow   = None
         self.bc_right_inflow  = None
         self.data_dir = "./data/"
 
@@ -251,8 +271,8 @@ class Sn:
         out = np.empty((new_grid.size, data.shape[1]), dtype=float)
         out[:, 0] = new_grid
         xp = data[:, 0]
-        for i in range(1, data.shape[1]):
-            out[:, i] = np.interp(new_grid, xp, data[:, i])
+        for i in range(1, data.shape[1]): out[:, i] = np.interp(new_grid, xp, data[:, i])
+
         return out
 
     def _load_or_build_data(self):
@@ -407,6 +427,27 @@ class Sn:
                     sigma_gtg[l, gp, g] = (sig_s0[gp] * acc * dx) / den
         return sigma_gtg
 
+    def _expand_boundary_moments_to_inflow(self, left_m=None, right_m=None):
+        Nh = self.num_ordinates // 2
+        mu_pos = np.abs(self.mu[:Nh])
+        Lmax_solver = self.leg_order - 1  # solver supports up to this order
+    
+        def build_side(M, sign):
+            if M is None:
+                return None
+            Lb1, G = M.shape  # L_b+1, G
+            inflow = np.zeros((Nh, G), dtype=float)
+            for g in range(G):
+                # Use only provided orders 0..L_b
+                for l in range(Lb1):
+                    inflow[:, g] += (2*l + 1) * M[l, g] * eval_legendre(l, sign * mu_pos)
+            return inflow
+    
+        left_in  = build_side(left_m,  +1.0)  # left boundary uses P_l(+μ)
+        right_in = build_side(right_m, -1.0)  # right boundary uses P_l(-μ)
+    
+        return left_in, right_in
+
     def sample_source_from_geometry(self, geom_layout, source_norm=1.0, max_resamples=20, damp=0.7):
         """
         Build per-group Fourier coefficients gated by geometry mask (0=no source, 1=source).
@@ -546,10 +587,7 @@ class Sn:
         """Solve S_N transport for a prescribed spatial Fourier external source of order N."""
         S, G, L = self.num_sections, self.num_groups, self.leg_order
         Nmu = self.num_ordinates
-    
-        bc_map = {"reflecting": 0, "vacuum": 1}
-        bc_code = bc_map[self.bc_type]
-    
+
         # Cast data
         sigt_sec = self.sigt_sec
         scat     = self.scatter_mats_sec
@@ -557,26 +595,50 @@ class Sn:
         mu       = self.mu
         w        = self.weight
         dx       = self.dx
+        Nh = self.num_ordinates // 2
+        mu_pos = np.abs(mu[:Nh])
+        mu_neg = np.abs(mu[Nh:])
+        w_pos  = w[:Nh]
+        w_neg  = w[Nh:]
     
+        code_map = {"reflecting": 0, "vacuum": 1, "inflow": 2}
+        bc_code = code_map[self.bc_type]
+        
+        left_all = right_all = None
+        if bc_code == 2:
+            # self.bc_left_moments/right_moments must be (L_b+1, G)
+            left_all, right_all = self._expand_boundary_moments_to_inflow(
+                self.bc_left_moments, self.bc_right_moments
+            )
+            self.bc_left_inflow  = left_all
+            self.bc_right_inflow = right_all 
+
         # Build source from geometry layout (node mask = cell_layout)
         geom_mask_nodes = np.tile(self.cell_layout, (G, 1))  
         _, _, Qmom = self.sample_source_from_geometry(geom_mask_nodes)
+        
+        leg_pos = leg_full[:, :self.num_ordinates//2]   
+        leg_neg = leg_full[:, self.num_ordinates//2:]   
+
+        total_src = np.zeros((S, Nmu), dtype=np.float64)
+        for g in range(G):
+            for l in range(L): total_src += ((2*l + 1) / 2) * Qmom[:, l, g][:, None] * leg_full[l, :][None, :]
 
         # Initial guess
         flux = np.ones((S, L, G), dtype=np.float64)
         
         for it in range(max_outer):
             flux_new = _outer_iteration_parallel_fixed(
-                flux, sigt_sec, scat, Qmom, dx, mu, w, leg_full,
-                bc_code, theta_relax, max_inner, eps_inner)
-            num = np.linalg.norm(flux_new - flux)
-            den = np.linalg.norm(flux) + 1e-30
-            l2 = num / den
+                       flux, sigt_sec, scat, Qmom, dx, mu, w, leg_full,
+                        bc_code, left_all, right_all,
+                        theta_relax, max_inner, eps_inner)
+            l2 = np.linalg.norm(flux_new - flux) / np.linalg.norm(flux)
             if it % 25 == 0: print(f"[outer {it}] L2={l2:.5e}")
+
             flux = alpha_underrelax * flux_new + (1.0 - alpha_underrelax) * flux
             if l2 < eps_outer: break
 
-        print(f"Number of Iterations for Run {self.run}: {it}")
+        print(f"Number of Iterations for Run {self.run+1}: {it}")
         return flux
     
 def bc_ytrain(num_ordinates,bc_order,mu, phi_g):
@@ -634,7 +696,7 @@ num_groups = 8
 num_nodes = 1
 dx = .001
 
-runs = 100
+runs = 25000
 xtrain = []
 ytrain = []
 
@@ -665,15 +727,21 @@ for run in range(runs):
     # scalar flux moments 
     fourier_moments = np.zeros((int(2 * source_order + 1), num_groups))
     print("Solving Flux Least Squares System")
-    for g in range(num_groups): fourier_moments = source_ytrain(sn.num_sections,source_order,phi[:,g])
+    for g in range(num_groups): fourier_moments[:,g] = source_ytrain(sn.num_sections,source_order,phi[:,g])
     print("Elapsed:", np.round(time.time() - stt,6), "s")
     # convert to dataframe
 
     # save to df for each run
     # xtrain
+    if sn.bc_left_inflow == None: left_feat = np.zeros(sn.num_ordinates//2 * sn.num_groups)
+    else: sn.bc_left_inflow.ravel()
+    if sn.bc_right_inflow == None: right_feat = np.zeros(sn.num_ordinates//2 * sn.num_groups)
+    else: sn.bc_right_inflow.ravel()
     row_num = np.concatenate([
         sn.sig_t_H.ravel(),
         sn.xsH_gtg.ravel(),
+        left_feat,
+        right_feat,
         sn.source_coeffs.ravel(),
         np.array([NH], dtype=np.float64),
     ])
@@ -688,6 +756,11 @@ for run in range(runs):
         fourier_moments.ravel(),
         ])
     ytrain.append(row)
+
+#Xtrain = np.array(xtrain)
+#Ytrain = np.array(ytrain)
+#print(f"Xtrain shape: {Xtrain.shape}")
+#print(f"Ytrain shape: {Ytrain.shape}")
 
 df = pd.DataFrame(xtrain)
 df.to_csv(f"data/xtrain_{runs}.csv",index=False)
@@ -721,12 +794,12 @@ if plotting:
         fig, ax = plt.subplots(figsize=(6, 3.8))
         im = ax.imshow(ang.T, aspect='auto', origin='lower',
                        extent=[0, sn.num_nodes, -1, 1], interpolation='nearest')
-        ax.set_title(fr"Group {g} — $\psi (x)$")
+        ax.set_title(fr"Group {g+1} — $\psi (x)$")
         ax.set_xlabel("Section")
         ax.set_ylabel(r"$\mu$")
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cbar.ax.set_ylabel(r"$\psi$")
-        fig.savefig(f"{save_dir}/psi_g{g}.png", dpi=200, bbox_inches="tight")
+        fig.savefig(f"{save_dir}/psi_g{g+1}.png", dpi=200, bbox_inches="tight")
         plt.close(fig)
     
         # Scalar flux scatter with H/U shading
@@ -734,12 +807,14 @@ if plotting:
         fig, ax = plt.subplots(figsize=(6, 3.2))
         #shade_material(ax)
         ax.plot(x, phi[:,g])
-        ax.set_title(fr"Group {g} — $\phi (x)$")
+        ax.set_xlim([0,1])
+        ax.set_title(fr"Group {g+1} — $\phi (x)$")
         ax.set_xlabel("Section")
         ax.set_ylabel(r"$\phi$")
+        ax.grid(which="Both")
         # optional legend
-        legend_patches = [Patch(facecolor='blue', alpha=0.12, label='A=1 (H)'),
-                          Patch(facecolor='red',  alpha=0.12, label='A=238 (U)')]
-        ax.legend(handles=legend_patches, loc='upper right', frameon=False)
-        fig.savefig(f"{save_dir}/phi_g{g}.png", dpi=200, bbox_inches="tight")
+#        legend_patches = [Patch(facecolor='blue', alpha=0.12, label='A=1 (H)'),
+#                          Patch(facecolor='red',  alpha=0.12, label='A=238 (U)')]
+#        ax.legend(handles=legend_patches, loc='upper right', frameon=False)
+        fig.savefig(f"{save_dir}/phi_g{g+1}.png", dpi=200, bbox_inches="tight")
         plt.close(fig)
