@@ -4,7 +4,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from numpy.polynomial.legendre import leggauss
-from scipy.special import lpmv
+from scipy.special import eval_legendre, lpmv
+from scipy.linalg import lstsq
 from numba import njit, prange
 np.random.seed(10)
 
@@ -203,6 +204,12 @@ class Sn:
 
         self.nu = 2.43
         self.bc_type = bc_type.lower()
+
+        # optional: moments; you may keep them different per side if desired
+        self.bc_left_moments  = None   # (L_src, G) or None
+        self.bc_right_moments = None   # (L_src, G) or None
+        self.bc_left_inflow   = None   # cached (Nh, G)
+        self.bc_right_inflow  = None
         self.data_dir = "./data/"
 
         self.leg_order = leg_order
@@ -217,10 +224,8 @@ class Sn:
         self.sig_t_U = None; self.sig_s0_U = None
         self.sigma_f = None
         self.chi = None
-
         self.xsH_gtg = None
         self.xsU_gtg = None
-
         self.sigt_sec = None
         self.scatter_mats_sec = None
 
@@ -536,7 +541,7 @@ class Sn:
         return l2 < eps
 
     def run_fixed_source(self, A_coeffs=None, B_coeffs=None,
-                     max_outer=20000, alpha_underrelax=0.7, eps_outer=1e-5,
+                     max_outer=2000, alpha_underrelax=0.7, eps_outer=1e-6,
                      theta_relax=0.6, max_inner=20000, eps_inner=1e-4):
         """Solve S_N transport for a prescribed spatial Fourier external source of order N."""
         S, G, L = self.num_sections, self.num_groups, self.leg_order
@@ -567,12 +572,60 @@ class Sn:
             num = np.linalg.norm(flux_new - flux)
             den = np.linalg.norm(flux) + 1e-30
             l2 = num / den
-            if it % 10 == 0: print(f"[outer {it}] L2={l2:.5e}")
+            if it % 25 == 0: print(f"[outer {it}] L2={l2:.5e}")
             flux = alpha_underrelax * flux_new + (1.0 - alpha_underrelax) * flux
             if l2 < eps_outer: break
 
+        print(f"Number of Iterations for Run {self.run}: {it}")
         return flux
     
+def bc_ytrain(num_ordinates,bc_order,mu, phi_g):
+    def get_psi(num_ordinates, mu, leg_order,phi):
+        Nh = num_ordinates // 2
+        mu_pos = np.abs(mu[:Nh])
+        
+        psi_l = np.zeros((Nh))
+        psi_r = np.zeros((Nh))
+        
+        for l in range(leg_order):
+            psi_l[:] += (2*l + 1) * phi[0, l]     * eval_legendre(l,  mu_pos)
+            psi_r[:] += (2*l + 1) * phi[-1, l]    * eval_legendre(l, -mu_pos)
+        
+        return psi_l, psi_r
+
+    # solve the least squares system to get boundary moments
+    # Setup outgoing BC linear systems
+    mu_p = np.abs(mu[:num_ordinates//2])
+    A_l = np.zeros((int(num_ordinates / 2), bc_order))
+    A_r = np.zeros((int(num_ordinates / 2), bc_order))
+    for l in range(bc_order):
+        A_l[:, l] = (2 * l + 1) * eval_legendre(l, -mu_p)
+        A_r[:, l] = (2 * l + 1) * eval_legendre(l, mu_p)
+
+    b_l,b_r = get_psi(num_ordinates, mu, bc_order, phi_g)
+    
+    coeffs_l, res, _, _ = lstsq(A_l,b_l)
+    coeffs_r, res, _, _ = lstsq(A_r,b_r)
+
+    return coeffs_l, coeffs_r
+
+def source_ytrain(num_nodes,flux_order,phi_g):
+    # Build linear system
+    # Setup left side of least squares problem
+    A = np.ones((num_nodes, int(2 * flux_order + 1)))
+
+    # Discretized position of each value
+    x = np.linspace(0, 1, num_nodes)
+    # Compute cosines and sines
+    for k in range(flux_order):
+        A[:, 2 * k + 1] = np.cos(np.pi * (k + 1) * x)
+        A[:, 2 * k + 2] = np.sin(np.pi * (k + 1) * x)
+    b = phi_g
+
+    coeffs, res, _, _ = lstsq(A,b)
+
+    return coeffs
+
 # run
 leg_order = 4
 source_order = 4
@@ -581,14 +634,14 @@ num_groups = 8
 num_nodes = 1
 dx = .001
 
-runs = 10
+runs = 100
 xtrain = []
 ytrain = []
 
 print(f"Order: {leg_order}")
 print(f"Ordinates: {num_ordinates}")
 print(f"Groups: {num_groups}")
-print(f"Nodes: {num_nodes}")
+print(f"Nodes: {int(num_nodes/dx)}")
 print(f"dx: {dx}")
 
 start = time.time()
@@ -601,35 +654,46 @@ for run in range(runs):
     sn = Sn(leg_order,num_ordinates, num_groups, num_nodes, NH, dx, bc_type, source_order, run)
     flux_moments = sn.run_fixed_source()
     phi = np.sum(flux_moments,axis=1)
+    
+    # boundary moments
+    bc_l = np.zeros((leg_order,num_groups))
+    bc_r = np.zeros((leg_order,num_groups))
+    print("Solving BC Least Squares System")
+    for g in range(num_groups): bc_l[:,g], bc_r[:,g] = bc_ytrain(num_ordinates,
+                                                                    leg_order,sn.mu, flux_moments[:,:,g])
+
+    # scalar flux moments 
+    fourier_moments = np.zeros((int(2 * source_order + 1), num_groups))
+    print("Solving Flux Least Squares System")
+    for g in range(num_groups): fourier_moments = source_ytrain(sn.num_sections,source_order,phi[:,g])
     print("Elapsed:", np.round(time.time() - stt,6), "s")
+    # convert to dataframe
 
     # save to df for each run
     # xtrain
-#    row_num = np.concatenate([
-#        sn.sig_t_H.ravel(),
-#        sn.xsH_gtg.ravel(),
-#        sn.source_coeffs.ravel(),
-#        np.array([NH], dtype=np.float64),
-#    ])
-#    
-#    row = np.concatenate([row_num.astype(object), np.array([bc_type], dtype=object)])
-#    xtrain.append(row)
+    row_num = np.concatenate([
+        sn.sig_t_H.ravel(),
+        sn.xsH_gtg.ravel(),
+        sn.source_coeffs.ravel(),
+        np.array([NH], dtype=np.float64),
+    ])
+    
+    row = np.concatenate([row_num.astype(object), np.array([bc_type], dtype=object)])
+    xtrain.append(row)
 
     # ytrain
-#    phi_moments = np.zeros_like(sn.source_coeffs)
-#    print(phi_moments.shape)
-#    phi_foo = np_fourier_expansion(sn.source_coeffs[:,0], source_order, num_groups, sn.num_sections)
-#    print(phi_foo.shape)
-#
-#    for i in range(num_groups): phi_moments[:,i] = (np_fourier_expansion(sn.source_coeffs[:,i], 
-#                                                    source_order, num_groups, sn.num_sections))
-#    ytrain.append(phi_moments.ravel())
+    row = np.concatenate([
+        bc_l.ravel(),
+        bc_r.ravel(),
+        fourier_moments.ravel(),
+        ])
+    ytrain.append(row)
 
-#df = pd.DataFrame(xtrain)
-#df.to_csv(f"data/xtrain_{runs}.csv",index=False)
+df = pd.DataFrame(xtrain)
+df.to_csv(f"data/xtrain_{runs}.csv",index=False)
 
-#df = pd.DataFrame(ytrain)
-#df.to_csv(f"data/ytrain_{runs}.csv",index=False)
+df = pd.DataFrame(ytrain)
+df.to_csv(f"data/ytrain_{runs}.csv",index=False)
 
 print(f"Total Time = {np.round(time.time() - start,6)} s")
 
