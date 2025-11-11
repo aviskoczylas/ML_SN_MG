@@ -10,10 +10,12 @@ from numba import njit
 from numpy.polynomial.legendre import leggauss
 print(time.time()-start_time)
 
+k_alpha = 0.7  #underrelaxation coefficient to help convergence for k
+flux_alpha = 1 #underrelaxation coefficient to help convergence, necessary for higher ordinates (64 needed alpha = 0.05)
 num_ordinates = 16
 dx = 0.5
 assert np.abs(1/dx-int(1/dx)) < 1e-6 #each cell must be evenly split
-save_dir = "charts"
+save_dir = "charts/no class"
 data_dir  = "data"
 data_path = os.path.join(data_dir, "xs_coarse_lattice.csv")
 data = np.array(pd.read_csv(data_path))
@@ -24,8 +26,6 @@ num_groups = round(groups[-1])
 num_cells = round(cell_index[-1])
 total_xs = data[:,2]
 total_xs = np.reshape(total_xs,(num_cells, num_groups))
-scatter_xs = data[:,3]
-scatter_xs = np.reshape(scatter_xs,(num_cells, num_groups))
 fission_abs_xs = data[:,4]
 fission_abs_xs = np.reshape(fission_abs_xs,(num_cells, num_groups))
 #since fission neutrons are only deposited in group 0, we can get rid of the data for other groups, it's all 0. 
@@ -37,16 +37,17 @@ g2g_p0_scatter_xs = np.reshape(g2g_p0_scatter_xs,(num_cells, num_groups, num_gro
 #form [cell num, current group, group scattered into]
 g2g_p1_scatter_xs = data[:,14:]
 g2g_p1_scatter_xs = np.reshape(g2g_p1_scatter_xs,(num_cells, num_groups, num_groups))
-
-scatter_matrices = np.stack((g2g_p0_scatter_xs, g2g_p1_scatter_xs), axis = 0)
+#random s2 and s3
+g2g_p2_scatter_xs = g2g_p1_scatter_xs * (np.random.rand(*g2g_p1_scatter_xs.shape)+0.5)
+g2g_p3_scatter_xs = g2g_p1_scatter_xs * (np.random.rand(*g2g_p1_scatter_xs.shape)+0.5)
+scatter_matrices = np.stack((g2g_p0_scatter_xs, g2g_p1_scatter_xs, g2g_p2_scatter_xs, g2g_p3_scatter_xs), axis = 0)
+order = len(scatter_matrices)#technically this is order+1
 
 neutrons_per_fission = 2.5
 num_sections = round(num_cells/dx)
 cell_indices = np.floor(np.arange(num_sections)*dx).astype(int)
-order = 2 #actually this is order+1, but i don't feel like putting a +1 everywhere.
 
 quadrature_points,weight = leggauss(num_ordinates)
-
  #precalculate the legendre polynomials for the quadrature up to the desired order
 #this code assumes that all scattering and flux moments are given to the same order
 legendre = np.zeros((order, num_ordinates))
@@ -78,7 +79,7 @@ def converged(flux_m, flux_m_plus_1, loop):
         return False
     diff = np.linalg.norm(flux_m_plus_1 - flux_m)
     norm = np.linalg.norm(flux_m)
-    E = 1e-6
+    E = 1e-4#6
     l2 = diff / (norm+1e-12)#1e-12 prevents divide by 0
     if loop:
         print("L2,",loop, l2)
@@ -107,13 +108,13 @@ prev_fission_source, prev_g2g_source = None, None
 
 bc_type_r = "reflecting" #options are fixed, reflecting, and vacuum
 bc_type_l = "vacuum"
-incoming_moments_l = np.array([0.1,0]) #for constant bc, this is a given. For reflecting and vacuum BC, this is a guess
-incoming_moments_r = np.array([0.1,0]) #only used for the case of constant bc
-in_group_source = np.ones((num_sections, num_ordinates, num_groups))*0.01 #initial guess
-g2g_source = np.ones((num_sections, num_ordinates, num_groups))*0.01#initial guess, source is summed over all incoming groups
-fission_source = np.ones((num_sections, num_ordinates, num_groups))*0.01 #initial guess
+incoming_moments_l = np.array([0.1,0,0,0]) #for constant bc, this is a given. For reflecting and vacuum BC, this is a guess
+incoming_moments_r = np.array([0.1,0,0,0]) #only used for the case of constant bc
+in_group_source = np.ones((num_sections, num_ordinates, num_groups)) #initial guess
+g2g_source = np.ones((num_sections, num_ordinates, num_groups))#initial guess, source is summed over all incoming groups
+fission_source = np.ones((num_sections, num_ordinates, num_groups)) #initial guess
 flux_moments = np.zeros((num_sections, order, num_groups))
-flux_moments[:, 0, :] = 0.01 #initial guess
+flux_moments[:, 0, :] = 0.1 #initial guess
 
 left_edge_cell_flux = moments_to_flux(incoming_moments_l)[num_ordinates//2:] #initial guess if reflecting
 k=1 #initial guess
@@ -182,8 +183,7 @@ while not converged(prev_fission_source, fission_source, "outer loop: "): #outer
     source = np.zeros((num_sections, num_ordinates, num_groups))
     if prev_fission_source is not None:
         k_new = k * np.sum(fission_source)/np.sum(prev_fission_source) #power iteration
-        alpha = 0.7  #underrelaxation coefficient to help converge
-        k = alpha * k_new + (1 - alpha) * k
+        k = k_alpha * k_new + (1 - k_alpha) * k
     prev_fission_source = fission_source.copy()
     #chi is approximated as only depositing neutrons in the highest energy group, so no need to iterate over groups
     fission_source = np.zeros((num_sections, num_ordinates, num_groups))
@@ -202,6 +202,7 @@ while not converged(prev_fission_source, fission_source, "outer loop: "): #outer
                 in_group_source[:,:,group] = in_group_scatter_expansion(prev_group_flux, group)
                 source[:,:,group] = fission_source[:,:,group]+g2g_source[:,:,group]+in_group_source[:,:,group]
                 group_flux_moments, left_edge_cell_flux = transport_sweep(group,source[:,:,group], left_edge_cell_flux)
+                group_flux_moments = flux_alpha * group_flux_moments + (1 - flux_alpha) * prev_group_flux
             flux_moments[:,:,group] = group_flux_moments
 
 # report scalar flux in each cell
@@ -212,7 +213,7 @@ for g in range(num_groups):
     plt.xlabel("Cell index")
     plt.ylabel("Scalar flux")
     plt.title(f"Group {g} Scalar flux")
-    plt.savefig(f"{save_dir}/phi_g{g}_no_class.png", bbox_inches="tight")
+    plt.savefig(f"{save_dir}/phi_g{g}.png", bbox_inches="tight")
     plt.cla()
 
     ang = moments_to_flux(flux_moments[:, :, g])  
@@ -224,12 +225,12 @@ for g in range(num_groups):
     ax.set_ylabel("μ")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.ax.set_ylabel("ψ")
-    fig.savefig(f"{save_dir}/psi_g{g}_no_class.png", dpi=200, bbox_inches="tight")
+    fig.savefig(f"{save_dir}/psi_g{g}.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 plt.plot(x, np.sum(scalar_flux, axis=1))
 plt.xlabel("Cell index")
 plt.ylabel("Scalar flux")
 plt.title("Overall scalar flux")
-plt.savefig(f"{save_dir}/phi_total_no_class.png", bbox_inches="tight")
+plt.savefig(f"{save_dir}/phi_total.png", bbox_inches="tight")
 print(time.time()-start_time)

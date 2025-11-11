@@ -583,7 +583,7 @@ if plotting:
     S, N, G = sn.num_sections, sn.num_ordinates, sn.num_groups
     scalar_flux = flux_moments[:, 0, :]
     mat = sn.mat_per_section  
-    save_dir = "charts"
+    save_dir = "charts/class"
     def shade_material(ax):
         # Map A -> (color, alpha). Match the legend colors.
         color_map = {
