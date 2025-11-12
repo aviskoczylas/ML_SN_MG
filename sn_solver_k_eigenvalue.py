@@ -204,8 +204,6 @@ class Sn:
 
         self.nu = 2.43
         self.bc_type = bc_type.lower()
-#        self.bc_l = bc_type_l.lower()
-#        self.bc_r = bc_type_r.lower()
         self.data_dir = "./data/"
 
         self.leg_order = leg_order
@@ -566,12 +564,8 @@ for run in range(runs):
     # xtrain
     row_num = np.concatenate([
         sn.sig_t_H.ravel(),
-#        sn.sig_t_U.ravel(),
         sn.xsH_gtg.ravel(),
-#        sn.xsU_gtg.ravel(),
-#        sn.sigma_f.ravel(),
         sn.cell_layout.ravel(),
-#        flux_moments[0, :, :].ravel(),
         np.array([k_eff], dtype=np.float64),
         np.array([NH], dtype=np.float64),
     ])
@@ -582,11 +576,16 @@ for run in range(runs):
     # ytrain
     ytrain.append(phi.ravel())
 
-df = pd.DataFrame(xtrain)
-df.to_csv(f"data/xtrain_{runs}.csv",index=False)
+xdata = np.array(xtrain)
+np.save(f"data/xdata_k-eigen_{runs}.npy")
+ydata = np.array(ytrain)
+np.save(f"data/ydata_k-eigen_{runs}.npy")
 
-df = pd.DataFrame(ytrain)
-df.to_csv(f"data/ytrain_{runs}.csv",index=False)
+#df = pd.DataFrame(xtrain)
+#df.to_csv(f"data/xtrain_{runs}.csv",index=False)
+#
+#df = pd.DataFrame(ytrain)
+#df.to_csv(f"data/ytrain_{runs}.csv",index=False)
 
 print(f"Total Time = {np.round(time.time() - start,6)} s")
 

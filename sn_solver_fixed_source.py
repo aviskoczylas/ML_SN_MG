@@ -7,7 +7,7 @@ from numpy.polynomial.legendre import leggauss
 from scipy.special import eval_legendre, lpmv
 from scipy.linalg import lstsq
 from numba import njit, prange
-np.random.seed(10)
+np.random.seed(42)
 
 def np_fourier_expansion(coeffs,order,num_nodes, num_sections):
     x = np.linspace(0, num_nodes, num_sections)
@@ -16,6 +16,16 @@ def np_fourier_expansion(coeffs,order,num_nodes, num_sections):
         coeffs[2 * k + 1] * np.cos(np.pi * (k + 1) * x)
         + coeffs[2 * k + 2] * np.sin(np.pi * (k + 1) * x)
         for k in range(order))
+
+def np_legendre_expansion(direction, moments, bc_order, num_ordinates, mu):
+    """Compute the boundary conditions using a Legendre polynomial expansion.
+        Assumes discrete ordinate weights normalized to 1.
+    """
+    # Get Legendre quadrature set
+    bc = np.zeros_like(mu)
+    # Compute BCs
+    for l in range(bc_order): bc += (2 * l + 1) * moments[l] * eval_legendre(l, direction * mu)
+    return bc
 
 @njit(fastmath=True)
 def _half_moment(leg, w, psi):
@@ -641,7 +651,7 @@ class Sn:
         print(f"Number of Iterations for Run {self.run+1}: {it}")
         return flux
     
-def bc_ytrain(num_ordinates,bc_order,mu, phi_g):
+def bc_ydata(num_ordinates,bc_order,mu, phi_g):
     def get_psi(num_ordinates, mu, leg_order,phi):
         Nh = num_ordinates // 2
         mu_pos = np.abs(mu[:Nh])
@@ -671,7 +681,7 @@ def bc_ytrain(num_ordinates,bc_order,mu, phi_g):
 
     return coeffs_l, coeffs_r
 
-def source_ytrain(num_nodes,flux_order,phi_g):
+def source_ydata(num_nodes,flux_order,phi_g):
     # Build linear system
     # Setup left side of least squares problem
     A = np.ones((num_nodes, int(2 * flux_order + 1)))
@@ -696,9 +706,9 @@ num_groups = 8
 num_nodes = 1
 dx = .001
 
-runs = 25000
-xtrain = []
-ytrain = []
+runs = 1
+xdata = []
+ydata = []
 
 print(f"Order: {leg_order}")
 print(f"Ordinates: {num_ordinates}")
@@ -721,25 +731,25 @@ for run in range(runs):
     bc_l = np.zeros((leg_order,num_groups))
     bc_r = np.zeros((leg_order,num_groups))
     print("Solving BC Least Squares System")
-    for g in range(num_groups): bc_l[:,g], bc_r[:,g] = bc_ytrain(num_ordinates,
+    for g in range(num_groups): bc_l[:,g], bc_r[:,g] = bc_ydata(num_ordinates,
                                                                     leg_order,sn.mu, flux_moments[:,:,g])
 
     # scalar flux moments 
     fourier_moments = np.zeros((int(2 * source_order + 1), num_groups))
     print("Solving Flux Least Squares System")
-    for g in range(num_groups): fourier_moments[:,g] = source_ytrain(sn.num_sections,source_order,phi[:,g])
+    for g in range(num_groups): fourier_moments[:,g] = source_ydata(sn.num_sections,source_order,phi[:,g])
     print("Elapsed:", np.round(time.time() - stt,6), "s")
     # convert to dataframe
 
     # save to df for each run
-    # xtrain
+    # xdata
     if sn.bc_left_inflow == None: left_feat = np.zeros(sn.num_ordinates//2 * sn.num_groups)
     else: sn.bc_left_inflow.ravel()
     if sn.bc_right_inflow == None: right_feat = np.zeros(sn.num_ordinates//2 * sn.num_groups)
     else: sn.bc_right_inflow.ravel()
     row_num = np.concatenate([
-        sn.sig_t_H.ravel(),
-        sn.xsH_gtg.ravel(),
+        #sn.sig_t_H.ravel(),
+        #sn.xsH_gtg.ravel(),
         left_feat,
         right_feat,
         sn.source_coeffs.ravel(),
@@ -747,26 +757,26 @@ for run in range(runs):
     ])
     
     row = np.concatenate([row_num.astype(object), np.array([bc_type], dtype=object)])
-    xtrain.append(row)
+    xdata.append(row)
 
-    # ytrain
+    # ydata
     row = np.concatenate([
         bc_l.ravel(),
         bc_r.ravel(),
         fourier_moments.ravel(),
         ])
-    ytrain.append(row)
+    ydata.append(row)
 
-#Xtrain = np.array(xtrain)
-#Ytrain = np.array(ytrain)
-#print(f"Xtrain shape: {Xtrain.shape}")
-#print(f"Ytrain shape: {Ytrain.shape}")
+np.save(f"data/xdata_{runs}.npy", np.array(xdata))
+np.save(f"data/ydata_{runs}.npy", np.array(ydata))
 
-df = pd.DataFrame(xtrain)
-df.to_csv(f"data/xtrain_{runs}.csv",index=False)
-
-df = pd.DataFrame(ytrain)
-df.to_csv(f"data/ytrain_{runs}.csv",index=False)
+#df = pd.DataFrame(xdata)
+#df.to_csv(f"data/xdata_{runs}.csv",index=False)
+#
+#df = pd.DataFrame(ydata)
+#df.to_csv(f"data/ydata_{runs}.csv",index=False)
+# to load data:
+# loaded_xdata = np.load(f"data/xdata_{runs}.npy")
 
 print(f"Total Time = {np.round(time.time() - start,6)} s")
 
@@ -818,3 +828,23 @@ if plotting:
 #        ax.legend(handles=legend_patches, loc='upper right', frameon=False)
         fig.savefig(f"{save_dir}/phi_g{g+1}.png", dpi=200, bbox_inches="tight")
         plt.close(fig)
+
+    psi_l = np_legendre_expansion(-1,bc_l[:leg_order,0],leg_order,num_ordinates,np.abs(sn.mu[:num_ordinates//2]))
+    plt.figure()
+    plt.plot(np.linspace(-1,0,num_ordinates//2), psi_l, label = 'Group 1')
+    plt.title("Left Boundary Angular Flux")
+    plt.xlabel(r"$\mu$")
+    plt.ylabel(r"$\psi_{bc}^l$")
+    plt.grid(which="Both")
+    plt.legend()
+    plt.savefig(f"{save_dir}/left_bc.png")
+
+    psi_r = np_legendre_expansion(1,bc_r[:leg_order,0],leg_order,num_ordinates,np.abs(sn.mu[:num_ordinates//2]))
+    plt.figure()
+    plt.plot(np.linspace(0,1,num_ordinates//2), psi_r, label = 'Group 1')
+    plt.title("Right Boundary Angular Flux")
+    plt.xlabel(r"$\mu$")
+    plt.ylabel(r"$\psi_{bc}^r$")
+    plt.grid(which="Both")
+    plt.legend()
+    plt.savefig(f"{save_dir}/right_bc.png")
