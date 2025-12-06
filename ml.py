@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import os
 import tensorflow as tf
 from tensorflow.keras.callbacks import ModelCheckpoint
-from tensorflow.keras.models import Sequential
+from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import Dense, Input
 from tensorflow.keras.optimizers import Adam
 from scipy.special import roots_legendre
@@ -12,12 +12,13 @@ from sklearn.preprocessing import MinMaxScaler
 from scipy.special import lpmv
 from numpy.polynomial.legendre import leggauss
 
+use_stored_model = False
 a = 1 #thickness, not given in xdata
 num_groups = 8
 num_nodes = 100
 num_ordinates = 16
 epochs = 50
-num_hp_trials = 20
+num_hp_trials = 50
 source_order = 4
 bc_order = 4
 bc_data_in_y = 2*bc_order*num_groups
@@ -65,19 +66,9 @@ ytest = yscaler.transform(ytest)
 param_space = {
     'learning_rate': np.random.uniform(0.0001, 0.001, 10).tolist(),
     'num_layers': np.random.randint(1, 10, 10).tolist(),
-    'num_layer_nodes': [16, 32, 64, 128, 256],
-    'batch_size': [16, 32, 64, 128]
+    'num_layer_nodes': [16, 32, 64, 128, 256, 512],
+    'batch_size': [8, 16, 32, 64, 128]
 }
-
-def flux_loss_wrapper(source_order, bc_order, num_nodes, xtest):
-    #Returns a loss function that dynamically retrieves L_batch for each batch.
-    def loss_fn(ytrue, ypred):
-        batch_size = tf.shape(ytrue)[0]  # Get current batch size
-        batch_indices = tf.range(batch_size)  # Generate indices for batch
-        L_batch = tf.gather(xtest[:, 0], batch_indices)  # Extract L_batch dynamically
-        return _loss(ytrue, ypred, L_batch, source_order, bc_order, num_nodes)
-
-    return loss_fn
 
 def groupwise_fourier_expansion(coeffs, order, num_nodes, num_groups, x):
     #groupwise data is initially flattened in coeffs
@@ -110,13 +101,12 @@ def legendre_expansion(moments, bc_order, num_groups):
     angular_flux = tf.transpose(angular_flux, perm = [0,2,1])  #shape [batch, num_ordinates//2, num_groups]
     return angular_flux
 
-def _loss(ytrue, ypred, L_batch, s_order, b_order, num_nodes):
+def loss_func(ytrue, ypred):
     """
     Computes L2 loss on the Gauss-Legendre integral of the reconstructed spectrum.
     
     - y_true, y_pred: Coefficients to reconstruct the spectrum (shape: [batch, num_coeffs])
-    - L_batch: Tensor of shape [batch] containing different L values for each sample.
-    - order, num_nodes: Integers used in spectrum reconstruction.
+    - s_order, b_order, num_nodes: Integers used in spectrum reconstruction.
     
     Returns:
     - Scalar loss (L2 norm of integral error between reconstructed spectra).
@@ -125,14 +115,13 @@ def _loss(ytrue, ypred, L_batch, s_order, b_order, num_nodes):
     xi, wi = roots_legendre(num_nodes)
     xi = tf.convert_to_tensor(xi, dtype=tf.float32) 
     wi = tf.convert_to_tensor(wi, dtype=tf.float32)
-    L_batch = tf.cast(tf.reshape(L_batch, [-1, 1]), tf.float32)  
-    x_batch = (L_batch / 2) * (xi + 1) 
-    phi     = groupwise_fourier_expansion(ytrue[:,bc_data_in_y:], s_order, num_nodes, num_groups, x_batch)  
-    phi_pred = groupwise_fourier_expansion(ypred[:,bc_data_in_y:], s_order, num_nodes, num_groups, x_batch)  
+    x_batch = (a / 2) * (xi + 1) 
+    phi     = groupwise_fourier_expansion(ytrue[:,bc_data_in_y:], source_order, num_nodes, num_groups, x_batch)  
+    phi_pred = groupwise_fourier_expansion(ypred[:,bc_data_in_y:], source_order, num_nodes, num_groups, x_batch)  
 
     # Evaluate loss separately for each group
     phi_loss = 0
-    #for i in range(num_groups):
+    # for i in range(num_groups):
     #    phi_integral     = tf.matmul(phi[:,:,i],     tf.expand_dims(wi, axis=-1))  
     #    phi_pred_integral = tf.matmul(phi_pred[:,:,i], tf.expand_dims(wi, axis=-1))  
     #    phi_loss += tf.reduce_mean(tf.square(phi_integral - phi_pred_integral)) 
@@ -143,14 +132,14 @@ def _loss(ytrue, ypred, L_batch, s_order, b_order, num_nodes):
     #for some reason this works better than the commented groupwise method?
 
     bc_loss = 0
-    # bc_l     = legendre_expansion(ytrue[:,:bc_data_in_y//2], b_order, num_groups)
-    # bc_l_pred = legendre_expansion(ypred[:,:bc_data_in_y//2], b_order, num_groups)
-    # bc_loss += tf.reduce_mean(tf.square(bc_l - bc_l_pred)) 
+    bc_l     = legendre_expansion(ytrue[:,:bc_data_in_y//2], bc_order, num_groups)
+    bc_l_pred = legendre_expansion(ypred[:,:bc_data_in_y//2], bc_order, num_groups)
+    bc_loss += tf.reduce_mean(tf.square(bc_l - bc_l_pred)) 
 
-    # bc_r     = legendre_expansion(ytrue[:,bc_data_in_y//2:bc_data_in_y], b_order, num_groups)
-    # bc_r_pred = legendre_expansion(ypred[:,bc_data_in_y//2:bc_data_in_y], b_order, num_groups)
-    # bc_loss += tf.reduce_mean(tf.square(bc_r - bc_r_pred)) 
-    
+    bc_r     = legendre_expansion(ytrue[:,bc_data_in_y//2:bc_data_in_y], bc_order, num_groups)
+    bc_r_pred = legendre_expansion(ypred[:,bc_data_in_y//2:bc_data_in_y], bc_order, num_groups)
+    bc_loss += tf.reduce_mean(tf.square(bc_r - bc_r_pred)) 
+
     total_loss = phi_loss + bc_loss
 
     return total_loss
@@ -176,7 +165,7 @@ else:
 
         #model.compile(optimizer=Adam(learning_rate=lr), loss='mse', metrics=['mae'])
         model.compile(optimizer=Adam(learning_rate=lr), 
-                        loss=flux_loss_wrapper(source_order, bc_order, num_nodes, xtest), 
+                        loss=loss_func, 
                         metrics=['mae'])
 
         history = model.fit(xtrain, 
@@ -198,35 +187,47 @@ else:
     np.save(BEST_PARAMS_FILE, best_params)
     print("Saved best hyperparameters:", best_params)
 
-model = Sequential()
-model.add(Input(shape=(xtrain.shape[1],)))
-for _ in range(best_params['num_layers']):
-    model.add(Dense(best_params['num_layer_nodes'], activation='relu'))
-model.add(Dense(ytrain.shape[1], activation='linear'))
-model.compile(optimizer=Adam(learning_rate=best_params['learning_rate']), 
-                            loss=flux_loss_wrapper(source_order, bc_order, num_nodes, xtest),
-                            metrics=['mae'])
-history = model.fit(
-                xtrain, 
-                ytrain, 
-                epochs=epochs, 
-                batch_size=best_params['batch_size'], 
-                validation_data=(xtest, ytest),
-                verbose = 1)
+MODEL_FILE = "models/best_model.model.keras"
+if use_stored_model and os.path.exists(MODEL_FILE):
+    model = load_model(MODEL_FILE, custom_objects={'loss_fn': loss_func})
+else:
+    model = Sequential()
+    model.add(Input(shape=(xtrain.shape[1],)))
+    for _ in range(best_params['num_layers']):
+        model.add(Dense(best_params['num_layer_nodes'], activation='relu'))
+    model.add(Dense(ytrain.shape[1], activation='linear'))
+    model.compile(optimizer=Adam(learning_rate=best_params['learning_rate']), 
+                                loss=loss_func,
+                                metrics=['mae'])
 
-# learning curve
-plt.figure(figsize=(8, 5))
-plt.plot(history.history['loss'], label='Training Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.yscale("log")
-plt.xlabel('Epochs')
-plt.ylabel('Loss (MSE)')
-plt.yscale("log")
-plt.title('Learning Curve')
-plt.legend()
-plt.grid()
-plt.savefig("charts/ml/tf_nn_learning_curve.png")
-plt.close()
+    model_checkpoint_callback = ModelCheckpoint(
+        filepath=MODEL_FILE,
+        monitor='mae',
+        mode='max',
+        save_best_only=True)
+
+    history = model.fit(
+                    xtrain, 
+                    ytrain, 
+                    epochs=epochs, 
+                    batch_size=best_params['batch_size'], 
+                    validation_data=(xtest, ytest),
+                    callbacks = [model_checkpoint_callback],
+                    verbose = 1)
+
+    # learning curve
+    plt.figure(figsize=(8, 5))
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.yscale("log")
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss (MSE)')
+    plt.yscale("log")
+    plt.title('Learning Curve')
+    plt.legend()
+    plt.grid()
+    plt.savefig("charts/ml/tf_nn_learning_curve.png")
+    plt.close()
 
 def fourier_expansion(coeffs,order,num_nodes, num_groups):
     if coeffs.ndim == 1:
@@ -282,7 +283,7 @@ plt.close()
 best_idx = np.argmin(np.abs(residuals), axis=0)[0]
 worst_idx = np.argmax(np.abs(residuals), axis=0)[0]
 print(f"Best Index: {best_idx}, Worst Index: {worst_idx}")
-x = np.linspace(0, 1, num_nodes)  # Define x in the same way as fourier_expansion
+x = np.linspace(0, 1, num_nodes)
 
 def plot_flux(x, t, ytest, ypred, flux_order, num_nodes, idx, title):
     """Plot expansion and TT solution."""
@@ -307,11 +308,6 @@ def plot_flux(x, t, ytest, ypred, flux_order, num_nodes, idx, title):
         plt.grid()
         plt.savefig(f"charts/ml/tf_ytest_ypred_{idx}_group{g+1}.png")
         plt.close()
-
-# print(ytest[best_idx, bc_data_in_y:])  # ytest coeffs
-# print("\n\n")
-# print(ypred[best_idx, bc_data_in_y:])   # ypred_coeffs
-
 
 plot_flux(
     x,
