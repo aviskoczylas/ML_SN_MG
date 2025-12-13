@@ -1,3 +1,5 @@
+import time
+start = time.time()
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -11,13 +13,13 @@ from scipy.special import roots_legendre
 from sklearn.preprocessing import MinMaxScaler
 from scipy.special import lpmv
 from numpy.polynomial.legendre import leggauss
-
-use_stored_model = False
+print("Start time: "+str(time.time()-start))
+use_stored_model = True
 a = 1 #thickness, not given in xdata
 num_groups = 8
 num_nodes = 100
 num_ordinates = 16
-epochs = 50
+epochs = 300
 num_hp_trials = 50
 source_order = 4
 bc_order = 4
@@ -128,16 +130,19 @@ def loss_func(ytrue, ypred):
 
         # Compute L2 norm of integral error
 
+    #phi_loss = tf.reduce_mean(tf.abs(phi - phi_pred) / tf.abs(phi+1e-10)) 
     phi_loss += tf.reduce_mean(tf.square(phi - phi_pred)) 
     #for some reason this works better than the commented groupwise method?
 
     bc_loss = 0
     bc_l     = legendre_expansion(ytrue[:,:bc_data_in_y//2], bc_order, num_groups)
     bc_l_pred = legendre_expansion(ypred[:,:bc_data_in_y//2], bc_order, num_groups)
+    #bc_loss += tf.reduce_mean(tf.abs(bc_l - bc_l_pred) / tf.abs(bc_l+1e-10)) 
     bc_loss += tf.reduce_mean(tf.square(bc_l - bc_l_pred)) 
 
     bc_r     = legendre_expansion(ytrue[:,bc_data_in_y//2:bc_data_in_y], bc_order, num_groups)
     bc_r_pred = legendre_expansion(ypred[:,bc_data_in_y//2:bc_data_in_y], bc_order, num_groups)
+    #bc_loss += tf.reduce_mean(tf.abs(bc_r - bc_r_pred) / tf.abs(bc_r+1e-10)) 
     bc_loss += tf.reduce_mean(tf.square(bc_r - bc_r_pred)) 
 
     total_loss = phi_loss + bc_loss
@@ -189,7 +194,7 @@ else:
 
 MODEL_FILE = "models/best_model.model.keras"
 if use_stored_model and os.path.exists(MODEL_FILE):
-    model = load_model(MODEL_FILE, custom_objects={'loss_fn': loss_func})
+    model = load_model(MODEL_FILE, custom_objects={'loss_func': loss_func})
 else:
     model = Sequential()
     model.add(Input(shape=(xtrain.shape[1],)))
@@ -203,7 +208,7 @@ else:
     model_checkpoint_callback = ModelCheckpoint(
         filepath=MODEL_FILE,
         monitor='mae',
-        mode='max',
+        mode='min',
         save_best_only=True)
 
     history = model.fit(
@@ -219,7 +224,6 @@ else:
     plt.figure(figsize=(8, 5))
     plt.plot(history.history['loss'], label='Training Loss')
     plt.plot(history.history['val_loss'], label='Validation Loss')
-    plt.yscale("log")
     plt.xlabel('Epochs')
     plt.ylabel('Loss (MSE)')
     plt.yscale("log")
@@ -228,6 +232,20 @@ else:
     plt.grid()
     plt.savefig("charts/ml/tf_nn_learning_curve.png")
     plt.close()
+
+def np_legendre(moments, bc_order, num_groups, dir):
+    #moments arrive flattened, reshape to [num_samples, bc_order, num_groups]
+    if dir == -1:
+        legendre_values = legendre[:,:num_ordinates//2]
+    elif dir == 1:
+        legendre_values = legendre[:,num_ordinates//2:]
+    moments = np.reshape(moments, [-1, bc_order, num_groups])
+    flux = []
+    for g in range(num_groups):
+        flux.append(np.zeros((moments.shape[0], num_ordinates//2)))
+        for l in range(bc_order):
+            flux[g]+=(2*l+1)/2*np.outer(moments[:,l,g],legendre_values[l,:])
+    return flux
 
 def fourier_expansion(coeffs,order,num_nodes, num_groups):
     if coeffs.ndim == 1:
@@ -267,28 +285,21 @@ L2_phi = np.mean(np.linalg.norm(phi - phi_hat, axis = 1))
 print(f"L2 error on scalar flux = {np.round(L2_phi,5)}")
 
 # residuals
-residuals = np.abs(ytest[:, bc_data_in_y:] - ypred[:, bc_data_in_y:])
-plt.figure()
-plt.plot(residuals[:, 0], label="A0")
-plt.plot(residuals[:, 1], label="A1")
-plt.plot(residuals[:, 2], label="B1")
-plt.title("Testing Residuals for Fourier Coeffs")
-plt.xlabel("Sample Index")
-plt.ylabel("Error")
-plt.yscale("log")
-plt.legend()
-plt.savefig("charts/ml/tf_residuals.png")
-plt.close()
-
-best_idx = np.argmin(np.abs(residuals), axis=0)[0]
-worst_idx = np.argmax(np.abs(residuals), axis=0)[0]
+residuals = np.mean(abs(phi - phi_hat) / abs(phi+1e-10), axis=1) 
+best_idx = np.argmin(np.abs(residuals))
+worst_idx = np.argmax(np.abs(residuals))
 print(f"Best Index: {best_idx}, Worst Index: {worst_idx}")
 x = np.linspace(0, 1, num_nodes)
 
 def plot_flux(x, t, ytest, ypred, flux_order, num_nodes, idx, title):
     """Plot expansion and TT solution."""
-    true_fluxes = fourier_expansion(ytest, flux_order, num_nodes, num_groups)
-    pred_fluxes = fourier_expansion(ypred, flux_order, num_nodes, num_groups)
+    true_fluxes = fourier_expansion(ytest[bc_data_in_y:], flux_order, num_nodes, num_groups)
+    pred_fluxes = fourier_expansion(ypred[bc_data_in_y:], flux_order, num_nodes, num_groups)
+    true_boundary_l = np_legendre(ytest[:bc_data_in_y//2], bc_order, num_groups, -1)
+    pred_boundary_l = np_legendre(ypred[:bc_data_in_y//2], bc_order, num_groups, -1)
+    true_boundary_r = np_legendre(ytest[bc_data_in_y//2:bc_data_in_y], bc_order, num_groups, 1)
+    pred_boundary_r = np_legendre(ypred[bc_data_in_y//2:bc_data_in_y], bc_order, num_groups, 1)
+    mu = np.linspace(-1,0,num_ordinates//2)
     for g in range(num_groups):
         plt.clf()
         plt.plot(
@@ -304,29 +315,69 @@ def plot_flux(x, t, ytest, ypred, flux_order, num_nodes, idx, title):
         plt.xlabel("$x$")
         plt.ylabel("$\\phi(x)$")
         plt.legend()
-        plt.title(f"{title} Group {g+1}")
+        plt.title(f"{title} vs x, Group {g+1}")
         plt.grid()
-        plt.savefig(f"charts/ml/tf_ytest_ypred_{idx}_group{g+1}.png")
+        plt.savefig(f"charts/ml/tf_ytest_ypred_{idx}_phi_group{g+1}.png")
+        plt.close()
+
+        plt.clf()
+        plt.plot(
+            mu,
+            np.squeeze(true_boundary_l[g]),
+            label="Y-Test",
+        )
+        plt.plot(
+            mu,
+            np.squeeze(pred_boundary_l[g]),
+            label="Y-Pred",
+        )
+        plt.xlabel("$\\mu$")
+        plt.ylabel("$\\psi(\\mu)$")
+        plt.legend()
+        plt.title(f"{title} vs $\\mu$, Group {g+1}, Left Boundary")
+        plt.grid()
+        plt.savefig(f"charts/ml/tf_ytest_ypred_{idx}_lb_group{g+1}.png")
+        plt.close()
+
+
+        plt.clf()
+        plt.plot(
+            mu+1,
+            np.squeeze(true_boundary_r[g]),
+            label="Y-Test",
+        )
+        plt.plot(
+            mu+1,
+            np.squeeze(pred_boundary_r[g]),
+            label="Y-Pred",
+        )
+        plt.xlabel("$\\mu$")
+        plt.ylabel("$\\psi(\\mu)$")
+        plt.legend()
+        plt.title(f"{title} vs $\\mu$, Group {g+1}, Right Boundary")
+        plt.grid()
+        plt.savefig(f"charts/ml/tf_ytest_ypred_{idx}_rb_group{g+1}.png")
         plt.close()
 
 plot_flux(
     x,
     a,   # thickness
-    ytest[best_idx, bc_data_in_y:],  # ytest coeffs
-    ypred[best_idx, bc_data_in_y:],   # ypred_coeffs
+    ytest[best_idx, :],  # ytest coeffs
+    ypred[best_idx, :],   # ypred_coeffs
     source_order,
     num_nodes,
     best_idx,
-    f"Y-Test and Y-Pred vs x, Best Index"
+    f"Y-Test and Y-Pred, Best Index"
 )
 
 plot_flux(
     x,
     a,   # thickness
-    ytest[worst_idx, bc_data_in_y:],  # ytest coeffs
-    ypred[worst_idx, bc_data_in_y:],   # ypred_coeffs
+    ytest[worst_idx, :],  # ytest coeffs
+    ypred[worst_idx, :],   # ypred_coeffs
     source_order,
     num_nodes,
     worst_idx,
-    f"Y-Test and Y-Pred vs x, Worst Index"
+    f"Y-Test and Y-Pred, Worst Index"
 )
+print("End time: "+str(time.time()-start))
