@@ -24,7 +24,7 @@ def np_legendre_expansion(direction, moments, bc_order, num_ordinates, mu):
     # Get Legendre quadrature set
     bc = np.zeros_like(mu)
     # Compute BCs
-    for l in range(bc_order): bc += (2 * l + 1) * moments[l] * eval_legendre(l, direction * mu)
+    for l in range(bc_order): bc += (2 * l + 1) * moments[l] * eval_legendre(l, direction * mu) / 2
     return bc
 
 @njit(fastmath=True)
@@ -200,11 +200,12 @@ def _outer_iteration_parallel_fixed(flux_prev, sigt_sec, scatter_mats_sec,
     return flux_next
 
 def choose_bc_type():
-    rn = np.random.rand()
-    if rn < .25: bc_type = "reflecting"
-    elif rn < .75: bc_type = "inflow"
-    else: bc_type = "vacuum"
-    return bc_type
+    #rn = np.random.rand()
+    #if rn < .25: bc_type = "reflecting"
+    #elif rn < .75: bc_type = "inflow"
+    #else: bc_type = "vacuum"
+    #return bc_type
+    return 'inflow'
 
 def choose_NH(): return np.round(.1 * np.random.rand(),5)
 
@@ -301,7 +302,7 @@ class Sn:
         self.Evec = self.E0 * np.exp(-self.boundaries)
 
         self.sig_t_H  = H[:-1, 1] * self.NH
-        self.sig_s0_H = H[:-1, 2] * self.NH
+        self.sig_s0_H = H[:-1, 2] * self.NH 
         self.sig_t_U  = U[:-1, 1] * self.NU38 + U35[:-1,1] * self.NU35
         self.sig_s0_U = U[:-1, 2] * self.NU38 + U35[:-1,2] * self.NU35
         self.sigma_f  = self.get_data(sigma_f_raw,self.nbins,self.E0,self.Emin)[:-1,1] * self.NU38
@@ -312,7 +313,8 @@ class Sn:
         s = self.chi.sum()
         if s > 0: self.chi /= s
 
-        self.xsH_gtg = self._build_sigma_gtg(self.AH, self.sig_s0_H)
+        # div by 2 added to ensure that the scatter xs's are lower than the total xs's
+        self.xsH_gtg = self._build_sigma_gtg(self.AH, self.sig_s0_H) 
         self.xsU_gtg = self._build_sigma_gtg(self.AU, self.sig_s0_U)
 
     def _build_sigma_gtg(self, A, sig_s0):
@@ -329,7 +331,8 @@ class Sn:
         else:
             # choose geometry from rng
             rng = np.random.default_rng(seed=seed)
-            if self.num_nodes == 1: self.cell_layout = [1]
+            if self.num_nodes == 1: self.cell_layout = [0]
+            #if self.num_nodes == 1: self.cell_layout = [1]
             else: self.cell_layout = (rng.random(self.num_nodes) < float(p_U)).astype(int)
 
         # apply discritization
@@ -582,6 +585,27 @@ class Sn:
         return src
 
     @staticmethod
+    def bc_moments_to_inflow_np(bc_moments_LG, mu, leg_order):
+        """
+        bc_moments_LG: shape (L, G) where L=leg_order (e.g. 4), moments M_l(g)
+        mu: full mu array of length Nmu (your sn.mu)
+        returns inflow angular flux for left boundary: shape (Nh, G) on mu_pos
+        """
+        bc_moments_LG = np.asarray(bc_moments_LG, dtype=float)
+        L, G = bc_moments_LG.shape
+    
+        Nmu = mu.size
+        Nh = Nmu // 2
+        mu_pos = np.abs(mu[:Nh])
+    
+        inflow = np.zeros((Nh, G), dtype=float)
+        for l in range(L):
+            wl = 0.5 * (2*l + 1)                    
+            Pl = eval_legendre(l, mu_pos)           
+            inflow += (wl * Pl[:, None]) * bc_moments_LG[l, :][None, :]
+        return inflow
+
+    @staticmethod
     def converged(prev, curr, label=None, eps=1e-5):
     #def converged(prev, curr, label=None, eps=1e-6):
         if prev is None: return False
@@ -597,6 +621,22 @@ class Sn:
         """Solve S_N transport for a prescribed spatial Fourier external source of order N."""
         S, G, L = self.num_sections, self.num_groups, self.leg_order
         Nmu = self.num_ordinates
+        Nh = self.num_ordinates // 2
+
+        #read data for hydrogen cell
+        bc_file = 'data/ytrain_25000.csv'
+        df = pd.read_csv(bc_file)
+        row = df.iloc[self.run].to_numpy(dtype=float)
+        n_bc = L * G
+        bc_r_flat = row[n_bc:2*n_bc]
+        bc_r = bc_r_flat.reshape(L, G)  
+
+        left_all = self.bc_moments_to_inflow_np(bc_r, self.mu, L)
+        left_all = np.maximum(left_all, 0.0)
+        right_all = np.zeros_like(left_all) 
+        # save for building xtrain
+        self.bc_left_inflow  = left_all
+        self.bc_right_inflow = right_all 
 
         # Cast data
         sigt_sec = self.sigt_sec
@@ -605,7 +645,6 @@ class Sn:
         mu       = self.mu
         w        = self.weight
         dx       = self.dx
-        Nh = self.num_ordinates // 2
         mu_pos = np.abs(mu[:Nh])
         mu_neg = np.abs(mu[Nh:])
         w_pos  = w[:Nh]
@@ -614,14 +653,17 @@ class Sn:
         code_map = {"reflecting": 0, "vacuum": 1, "inflow": 2}
         bc_code = code_map[self.bc_type]
         
+        """
         left_all = right_all = None
         if bc_code == 2:
             # self.bc_left_moments/right_moments must be (L_b+1, G)
             left_all, right_all = self._expand_boundary_moments_to_inflow(
                 self.bc_left_moments, self.bc_right_moments
             )
+            left_all = psi_in_left[:Nh]
             self.bc_left_inflow  = left_all
             self.bc_right_inflow = right_all 
+        """
 
         # Build source from geometry layout (node mask = cell_layout)
         geom_mask_nodes = np.tile(self.cell_layout, (G, 1))  
@@ -643,7 +685,7 @@ class Sn:
                         bc_code, left_all, right_all,
                         theta_relax, max_inner, eps_inner)
             l2 = np.linalg.norm(flux_new - flux) / np.linalg.norm(flux)
-            if it % 25 == 0: print(f"[outer {it}] L2={l2:.5e}")
+            if it % 10 == 0: print(f"[outer {it}] L2={l2:.5e}")
 
             flux = alpha_underrelax * flux_new + (1.0 - alpha_underrelax) * flux
             if l2 < eps_outer: break
@@ -706,7 +748,7 @@ num_groups = 8
 num_nodes = 1
 dx = .001
 
-runs = 1
+runs = 25000
 xdata = []
 ydata = []
 
@@ -739,20 +781,20 @@ for run in range(runs):
     print("Solving Flux Least Squares System")
     for g in range(num_groups): fourier_moments[:,g] = source_ydata(sn.num_sections,source_order,phi[:,g])
     print("Elapsed:", np.round(time.time() - stt,6), "s")
-    # convert to dataframe
 
+    # convert to dataframe
     # save to df for each run
     # xdata
-    if sn.bc_left_inflow == None: left_feat = np.zeros(sn.num_ordinates//2 * sn.num_groups)
-    else: sn.bc_left_inflow.ravel()
-    if sn.bc_right_inflow == None: right_feat = np.zeros(sn.num_ordinates//2 * sn.num_groups)
-    else: sn.bc_right_inflow.ravel()
+#    if sn.bc_left_inflow == None: left_feat = np.zeros(sn.num_ordinates//2 * sn.num_groups)
+#    else: sn.bc_left_inflow.ravel()
+#    if sn.bc_right_inflow == None: right_feat = np.zeros(sn.num_ordinates//2 * sn.num_groups)
+#    else: sn.bc_right_inflow.ravel()
+    left_feat = sn.bc_left_inflow.ravel()
+    right_feat = sn.bc_left_inflow.ravel()
     row_num = np.concatenate([
-        #sn.sig_t_H.ravel(),
-        #sn.xsH_gtg.ravel(),
         left_feat,
         right_feat,
-        sn.source_coeffs.ravel(),
+#        sn.source_coeffs.ravel(),
         np.array([NH], dtype=np.float64),
     ])
     
@@ -767,8 +809,8 @@ for run in range(runs):
         ])
     ydata.append(row)
 
-np.save(f"data/xdata_{runs}.npy", np.array(xdata))
-np.save(f"data/ydata_{runs}.npy", np.array(ydata))
+np.save(f"data_H/xdata_{runs}.npy", np.array(xdata))
+np.save(f"data_H/ydata_{runs}.npy", np.array(ydata))
 
 #df = pd.DataFrame(xdata)
 #df.to_csv(f"data/xdata_{runs}.csv",index=False)
@@ -783,7 +825,7 @@ print(f"Total Time = {np.round(time.time() - start,6)} s")
 plotting = True
 if plotting:
     S, N, G = sn.num_sections, sn.num_ordinates, sn.num_groups
-    save_dir = "charts"
+    save_dir = "charts_H"
     def shade_material(ax):
         color_map = {0: ("blue", 0.12), 1: ("red",  0.12)}
         A = sn.cell_layout      
