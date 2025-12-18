@@ -224,8 +224,14 @@ class Sn:
         self.num_sections = self.num_nodes * self.sections_per_cell
         self.section_index_to_cell = (np.arange(self.num_sections) // self.sections_per_cell).astype(int)
 
+        bc_file = 'data/ydata_8500.csv'
+        df = pd.read_csv(bc_file)
+        self.row = df.iloc[self.run,:].to_numpy(dtype=float)
+        NH_file = 'data/xdata_8500.csv'
+        df = pd.read_csv(NH_file)
+        self.NH = df.iloc[self.run,-2]
         self.AH, self.AU = 1., 238.
-        self.NH = NH
+#        self.NH = NH
         self.NU35 = .0125
         self.NU38 = .0875
 
@@ -624,9 +630,7 @@ class Sn:
         Nh = self.num_ordinates // 2
 
         #read data for hydrogen cell
-        bc_file = 'data/ytrain_25000.csv'
-        df = pd.read_csv(bc_file)
-        row = df.iloc[self.run].to_numpy(dtype=float)
+        row = self.row
         n_bc = L * G
         bc_r_flat = row[n_bc:2*n_bc]
         bc_r = bc_r_flat.reshape(L, G)  
@@ -746,9 +750,9 @@ source_order = 4
 num_ordinates = 64
 num_groups = 8
 num_nodes = 1
-dx = .001
+dx = .005
 
-runs = 25000
+runs = 8500
 xdata = []
 ydata = []
 
@@ -764,8 +768,8 @@ for run in range(runs):
     # choose variable parameters
     NH = choose_NH()
     bc_type = choose_bc_type()
-    print(f"Run Number {run+1}, {bc_type} BC, NH = {NH}")
     sn = Sn(leg_order,num_ordinates, num_groups, num_nodes, NH, dx, bc_type, source_order, run)
+    print(f"Run Number {sn.run+1}, {sn.bc_type} BC, NH = {sn.NH}")
     flux_moments = sn.run_fixed_source()
     phi = np.sum(flux_moments,axis=1)
     
@@ -811,12 +815,6 @@ for run in range(runs):
 
 np.save(f"data_H/xdata_{runs}.npy", np.array(xdata))
 np.save(f"data_H/ydata_{runs}.npy", np.array(ydata))
-
-#df = pd.DataFrame(xdata)
-#df.to_csv(f"data/xdata_{runs}.csv",index=False)
-#
-#df = pd.DataFrame(ydata)
-#df.to_csv(f"data/ydata_{runs}.csv",index=False)
 # to load data:
 # loaded_xdata = np.load(f"data/xdata_{runs}.npy")
 
