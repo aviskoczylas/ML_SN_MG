@@ -18,12 +18,13 @@ use_stored_model = True
 a = 1 #thickness, not given in xdata
 num_groups = 8
 num_nodes = 100
-num_ordinates = 16
+num_ordinates = 64
 epochs = 300
-num_hp_trials = 50
+num_hp_trials = 100
 source_order = 4
 bc_order = 4
 bc_data_in_y = 2*bc_order*num_groups
+eps = 1e-10
 
 # load data
 xtrain = pd.read_csv("data/xtrain1.csv").to_numpy()
@@ -49,7 +50,7 @@ for sample in xtest:
     elif sample[-1] =="inflow":
         sample[-1] = 2
 
-#optionally truncate number of samples for speed.
+#optionally truncate for speed.
 reduction_factor = 1
 train_samples = xtrain.shape[0]
 test_samples = xtest.shape[0]
@@ -94,12 +95,15 @@ for l in range(bc_order):
         legendre[l, n] = lpmv(0, l, quadrature_points[n])
 legendre = tf.convert_to_tensor(legendre, dtype=tf.float32)
 
-def legendre_expansion(moments, bc_order, num_groups):
+def legendre_expansion(moments, bc_order, num_groups, dir):
     moments = tf.reshape(moments, [-1, bc_order, num_groups]) #shape [batch, bc_order, num_groups]
     weights = tf.cast(tf.expand_dims(((2*tf.range(bc_order)+1)/2), -1), tf.float32)
     weighted_moments = weights*moments  #shape [batch, bc_order, num_groups]
-    #direction does not matter since this is only for loss
-    angular_flux = tf.matmul(tf.transpose(weighted_moments, perm = [0,2,1]), legendre[:,:num_ordinates//2])  #shape [batch, num_groups, num_ordinates//2]
+    if dir == -1:
+        legendre_values = legendre[:,:num_ordinates//2]
+    elif dir == 1:
+        legendre_values = legendre[:,num_ordinates//2:]
+    angular_flux = tf.matmul(tf.transpose(weighted_moments, perm = [0,2,1]), legendre_values)  #shape [batch, num_groups, num_ordinates//2]
     angular_flux = tf.transpose(angular_flux, perm = [0,2,1])  #shape [batch, num_ordinates//2, num_groups]
     return angular_flux
 
@@ -130,19 +134,19 @@ def loss_func(ytrue, ypred):
 
         # Compute L2 norm of integral error
 
-    #phi_loss = tf.reduce_mean(tf.abs(phi - phi_pred) / tf.abs(phi+1e-10)) 
+    #phi_loss = tf.reduce_mean(tf.abs(phi - phi_pred) / tf.abs(phi+eps)) 
     phi_loss += tf.reduce_mean(tf.square(phi - phi_pred)) 
     #for some reason this works better than the commented groupwise method?
 
     bc_loss = 0
-    bc_l     = legendre_expansion(ytrue[:,:bc_data_in_y//2], bc_order, num_groups)
-    bc_l_pred = legendre_expansion(ypred[:,:bc_data_in_y//2], bc_order, num_groups)
-    #bc_loss += tf.reduce_mean(tf.abs(bc_l - bc_l_pred) / tf.abs(bc_l+1e-10)) 
+    bc_l     = legendre_expansion(ytrue[:,:bc_data_in_y//2], bc_order, num_groups, -1)
+    bc_l_pred = legendre_expansion(ypred[:,:bc_data_in_y//2], bc_order, num_groups, -1)
+    #bc_loss += tf.reduce_mean(tf.abs(bc_l - bc_l_pred) / tf.abs(bc_l+eps)) 
     bc_loss += tf.reduce_mean(tf.square(bc_l - bc_l_pred)) 
 
-    bc_r     = legendre_expansion(ytrue[:,bc_data_in_y//2:bc_data_in_y], bc_order, num_groups)
-    bc_r_pred = legendre_expansion(ypred[:,bc_data_in_y//2:bc_data_in_y], bc_order, num_groups)
-    #bc_loss += tf.reduce_mean(tf.abs(bc_r - bc_r_pred) / tf.abs(bc_r+1e-10)) 
+    bc_r     = legendre_expansion(ytrue[:,bc_data_in_y//2:bc_data_in_y], bc_order, num_groups, 1)
+    bc_r_pred = legendre_expansion(ypred[:,bc_data_in_y//2:bc_data_in_y], bc_order, num_groups, 1)
+    #bc_loss += tf.reduce_mean(tf.abs(bc_r - bc_r_pred) / tf.abs(bc_r+eps)) 
     bc_loss += tf.reduce_mean(tf.square(bc_r - bc_r_pred)) 
 
     total_loss = phi_loss + bc_loss
@@ -168,14 +172,13 @@ else:
             model.add(Dense(num_layer_nodes, activation='relu'))
         model.add(Dense(ytrain.shape[1], activation='linear'))
 
-        #model.compile(optimizer=Adam(learning_rate=lr), loss='mse', metrics=['mae'])
         model.compile(optimizer=Adam(learning_rate=lr), 
                         loss=loss_func, 
                         metrics=['mae'])
 
         history = model.fit(xtrain, 
                 ytrain, 
-                epochs=int(epochs/10), 
+                epochs=int(epochs/5), 
                 batch_size=batch_size, 
                 validation_data=(xtest, ytest), 
                 verbose=1,)
@@ -278,16 +281,44 @@ l2_errors = np.linalg.norm(ytest - ypred, axis=1)
 print(f"L2 Error on Output: {np.mean(l2_errors):.5f}")
 
 # dataset L2 error
-phi     = sum(fourier_expansion(ytest[:, bc_data_in_y:],source_order,num_nodes,num_groups))
-phi_hat = sum(fourier_expansion(ypred[:, bc_data_in_y:],source_order,num_nodes,num_groups))
+phi     = fourier_expansion(ytest[:, bc_data_in_y:],source_order,num_nodes,num_groups)
+phi_hat = fourier_expansion(ypred[:, bc_data_in_y:],source_order,num_nodes,num_groups)
+bc_l = np_legendre(ytest[:,:bc_data_in_y//2], bc_order, num_groups, -1)
+bc_l_hat = np_legendre(ypred[:,:bc_data_in_y//2], bc_order, num_groups, -1)
+bc_r = np_legendre(ytest[:,bc_data_in_y//2:bc_data_in_y], bc_order, num_groups, 1)
+bc_r_hat = np_legendre(ypred[:,bc_data_in_y//2:bc_data_in_y], bc_order, num_groups, 1)
 
-L2_phi = np.mean(np.linalg.norm(phi - phi_hat, axis = 1))
+L2_phis = [np.mean(np.linalg.norm(phi[g] - phi_hat[g], axis=1)) for g in range(num_groups)]
+L2_phi = np.mean(L2_phis)
 print(f"L2 error on scalar flux = {np.round(L2_phi,5)}")
-
+L2_bc_ls = [np.mean(np.linalg.norm(bc_l[g] - bc_l_hat[g], axis=1)) for g in range(num_groups)]
+L2_bc_l = np.mean(L2_bc_ls)
+print(f"L2 error on left boundary = {np.round(L2_bc_l,5)}")
+L2_bc_rs = [np.mean(np.linalg.norm(bc_r[g] - bc_r_hat[g], axis=1)) for g in range(num_groups)]
+L2_bc_r = np.mean(L2_bc_rs)
+print(f"L2 error on right boundary = {np.round(L2_bc_r,5)}")
 # residuals
-residuals = np.mean(abs(phi - phi_hat) / abs(phi+1e-10), axis=1) 
-best_idx = np.argmin(np.abs(residuals))
-worst_idx = np.argmax(np.abs(residuals))
+#phi_percent_errors = [np.mean(np.abs(phi[g] - phi_hat[g]) / (np.abs(phi[g]) + eps), axis=1) for g in range(num_groups)]
+
+#phi, bc, etc is list of num_groups arrays, each array is of shape [num_samples, num_nodes or num_ordinates//2]
+phi_percent_errors = [np.abs(phi[g] - phi_hat[g]) / (np.abs(phi[g]) + eps) for g in range(num_groups)] 
+bc_l_percent_errors = [np.abs(bc_l[g] - bc_l_hat[g]) / (np.abs(bc_l[g]) + eps) for g in range(num_groups)] 
+bc_r_percent_errors = [np.abs(bc_r[g] - bc_r_hat[g]) / (np.abs(bc_r[g]) + eps) for g in range(num_groups)] 
+group_percent_errors = []
+phi_group_percent_errors = []
+for g in range(num_groups):
+    phi_group_percent_errors.append(np.mean(phi_percent_errors[g], axis = 1))
+    bc_l_group_percent_error = np.mean(bc_l_percent_errors[g], axis = 1)
+    bc_r_group_percent_error = np.mean(bc_r_percent_errors[g], axis = 1)
+    group_percent_errors.append((phi_group_percent_errors[g] + (bc_l_group_percent_error + bc_r_group_percent_error) / 2) / 2)
+
+phi_percent_errors = np.mean(np.mean(phi_percent_errors, axis = 2), axis = 0)
+bc_l_percent_errors = np.mean(np.mean(bc_l_percent_errors, axis = 2), axis = 0)
+bc_r_percent_errors = np.mean(np.mean(bc_r_percent_errors, axis = 2), axis = 0)
+percent_errors = (phi_percent_errors + (bc_l_percent_errors + bc_r_percent_errors) / 2) / 2
+
+best_idx = np.argmin(np.abs(percent_errors))
+worst_idx = np.argmax(np.abs(percent_errors))
 print(f"Best Index: {best_idx}, Worst Index: {worst_idx}")
 x = np.linspace(0, 1, num_nodes)
 
@@ -299,7 +330,6 @@ def plot_flux(x, t, ytest, ypred, flux_order, num_nodes, idx, title):
     pred_boundary_l = np_legendre(ypred[:bc_data_in_y//2], bc_order, num_groups, -1)
     true_boundary_r = np_legendre(ytest[bc_data_in_y//2:bc_data_in_y], bc_order, num_groups, 1)
     pred_boundary_r = np_legendre(ypred[bc_data_in_y//2:bc_data_in_y], bc_order, num_groups, 1)
-    mu = np.linspace(-1,0,num_ordinates//2)
     for g in range(num_groups):
         plt.clf()
         plt.plot(
@@ -322,12 +352,12 @@ def plot_flux(x, t, ytest, ypred, flux_order, num_nodes, idx, title):
 
         plt.clf()
         plt.plot(
-            mu,
+            quadrature_points[:num_ordinates//2],
             np.squeeze(true_boundary_l[g]),
             label="Y-Test",
         )
         plt.plot(
-            mu,
+            quadrature_points[:num_ordinates//2],
             np.squeeze(pred_boundary_l[g]),
             label="Y-Pred",
         )
@@ -342,12 +372,12 @@ def plot_flux(x, t, ytest, ypred, flux_order, num_nodes, idx, title):
 
         plt.clf()
         plt.plot(
-            mu+1,
+            quadrature_points[num_ordinates//2:],
             np.squeeze(true_boundary_r[g]),
             label="Y-Test",
         )
         plt.plot(
-            mu+1,
+            quadrature_points[num_ordinates//2:],
             np.squeeze(pred_boundary_r[g]),
             label="Y-Pred",
         )
@@ -380,4 +410,94 @@ plot_flux(
     worst_idx,
     f"Y-Test and Y-Pred, Worst Index"
 )
+
+percent_errors *= 100
+plt.hist(percent_errors, bins = 100, range = (0,10), weights = np.ones_like(percent_errors)/len(percent_errors))
+plt.xlabel("Percent Error")
+plt.ylabel("Fraction of Samples")
+plt.title("Percent Error Histogram")
+plt.grid()
+plt.savefig(f"charts/ml/hist.png")
+plt.clf()
+plt.close()
+plt.hist(percent_errors, bins = 100, range = (0,100), weights = np.ones_like(percent_errors)/len(percent_errors))
+plt.xlabel("Percent Error")
+plt.ylabel("Fraction of Samples")
+plt.title("Percent Error Histogram")
+plt.grid()
+plt.savefig(f"charts/ml/full_hist.png")
+plt.clf()
+plt.close()
+percent_over_100 = len([i for i in percent_errors if i >= 100])/len(percent_errors)*100
+percent_over_10 = len([i for i in percent_errors if i >= 10])/len(percent_errors)*100
+percent_over_5 = len([i for i in percent_errors if i >= 5])/len(percent_errors)*100
+percent_less_than_5 = len([i for i in percent_errors if i < 5])/len(percent_errors)*100
+print(str(percent_over_100)+"% of samples over 100% relative error")
+print(str(percent_over_10)+"% of samples over 10% relative error")
+print(str(percent_over_5)+"% of samples over 5% relative error")
+print(str(percent_less_than_5)+"% of samples less than 5% relative error")
+
+phi_percent_errors *= 100
+plt.hist(phi_percent_errors, bins = 100, range = (0,10), weights = np.ones_like(percent_errors)/len(percent_errors))
+plt.xlabel("Percent Error")
+plt.ylabel("Fraction of Samples")
+plt.title("Percent Error Histogram on Flux")
+plt.grid()
+plt.savefig(f"charts/ml/phi_hist.png")
+plt.clf()
+plt.close()
+plt.hist(phi_percent_errors, bins = 100, range = (0,100), weights = np.ones_like(phi_percent_errors)/len(phi_percent_errors))
+plt.xlabel("Percent Error")
+plt.ylabel("Fraction of Samples")
+plt.title("Percent Error Histogram on Flux")
+plt.grid()
+plt.savefig(f"charts/ml/phi_full_hist.png")
+plt.clf()
+plt.close()
+print("Here, percent error is only evaluated using phi")
+percent_over_100 = len([i for i in phi_percent_errors if i >= 100])/len(phi_percent_errors)*100
+percent_over_10 = len([i for i in phi_percent_errors if i >= 10])/len(phi_percent_errors)*100
+percent_over_5 = len([i for i in phi_percent_errors if i >= 5])/len(phi_percent_errors)*100
+percent_less_than_5 = len([i for i in phi_percent_errors if i < 5])/len(phi_percent_errors)*100
+print(str(percent_over_100)+"% of samples over 100% relative error")
+print(str(percent_over_10)+"% of samples over 10% relative error")
+print(str(percent_over_5)+"% of samples over 5% relative error")
+print(str(percent_less_than_5)+"% of samples less than 5% relative error")
+
+group_percent_errors = [x*100 for x in group_percent_errors]
+phi_group_percent_errors = [x*100 for x in phi_group_percent_errors]
+for g in range(num_groups):
+    plt.hist(group_percent_errors[g], bins = 100, range = (0,10), weights = np.ones_like(group_percent_errors[g])/len(group_percent_errors[g]))
+    plt.xlabel("Percent Error")
+    plt.ylabel("Fraction of Samples")
+    plt.title(f"Percent Error Histogram, Group {g}")
+    plt.grid()
+    plt.savefig(f"charts/ml/hist_group_{g}.png")
+    plt.clf()
+    plt.close()
+    plt.hist(group_percent_errors[g], bins = 100, range = (0,100), weights = np.ones_like(group_percent_errors[g])/len(group_percent_errors[g]))
+    plt.xlabel("Percent Error")
+    plt.ylabel("Fraction of Samples")
+    plt.title(f"Percent Error Histogram, Group {g}")
+    plt.grid()
+    plt.savefig(f"charts/ml/full_hist_group_{g}.png")
+    plt.clf()
+    plt.close()
+    plt.hist(phi_group_percent_errors[g], bins = 100, range = (0,10), weights = np.ones_like(phi_group_percent_errors[g])/len(phi_group_percent_errors[g]))
+    plt.xlabel("Percent Error")
+    plt.ylabel("Fraction of Samples")
+    plt.title(f"Percent Error Histogram on Flux, Group {g}")
+    plt.grid()
+    plt.savefig(f"charts/ml/phi_hist_group_{g}.png")
+    plt.clf()
+    plt.close()
+    plt.hist(phi_group_percent_errors[g], bins = 100, range = (0,100), weights = np.ones_like(phi_group_percent_errors[g])/len(phi_group_percent_errors[g]))
+    plt.xlabel("Percent Error")
+    plt.ylabel("Fraction of Samples")
+    plt.title(f"Percent Error Histogram on Flux, Group {g}")
+    plt.grid()
+    plt.savefig(f"charts/ml/phi_full_hist_group_{g}.png")
+    plt.clf()
+    plt.close()
+
 print("End time: "+str(time.time()-start))
