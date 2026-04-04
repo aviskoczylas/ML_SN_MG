@@ -19,7 +19,7 @@ a = 1 #thickness, not given in xdata
 num_groups = 8
 num_nodes = 100
 num_ordinates = 64
-epochs = 300
+epochs = 150
 num_hp_trials = 100
 source_order = 4
 bc_order = 4
@@ -73,6 +73,10 @@ param_space = {
     'batch_size': [8, 16, 32, 64, 128]
 }
 
+xi, wi = roots_legendre(num_nodes)
+xi = tf.convert_to_tensor(xi, dtype=tf.float32) 
+wi = tf.convert_to_tensor(wi, dtype=tf.float32)
+
 def groupwise_fourier_expansion(coeffs, order, num_nodes, num_groups, x):
     #groupwise data is initially flattened in coeffs
     x = tf.reshape(x, [-1, num_nodes, 1])
@@ -118,9 +122,6 @@ def loss_func(ytrue, ypred):
     - Scalar loss (L2 norm of integral error between reconstructed spectra).
     """
     # Gauss-Legendre Quadrature (same method as before)
-    xi, wi = roots_legendre(num_nodes)
-    xi = tf.convert_to_tensor(xi, dtype=tf.float32) 
-    wi = tf.convert_to_tensor(wi, dtype=tf.float32)
     x_batch = (a / 2) * (xi + 1) 
     phi     = groupwise_fourier_expansion(ytrue[:,bc_data_in_y:], source_order, num_nodes, num_groups, x_batch)  
     phi_pred = groupwise_fourier_expansion(ypred[:,bc_data_in_y:], source_order, num_nodes, num_groups, x_batch)  
@@ -195,7 +196,7 @@ else:
     np.save(BEST_PARAMS_FILE, best_params)
     print("Saved best hyperparameters:", best_params)
 
-MODEL_FILE = "models/best_model.model.keras"
+MODEL_FILE = "models/best_fuel_model.model.keras"
 if use_stored_model and os.path.exists(MODEL_FILE):
     model = load_model(MODEL_FILE, custom_objects={'loss_func': loss_func})
 else:
@@ -210,7 +211,7 @@ else:
 
     model_checkpoint_callback = ModelCheckpoint(
         filepath=MODEL_FILE,
-        monitor='mae',
+        monitor='val_loss',
         mode='min',
         save_best_only=True)
 
@@ -237,11 +238,12 @@ else:
     plt.close()
 
 def np_legendre(moments, bc_order, num_groups, dir):
+    legendre_np = legendre.numpy()
     #moments arrive flattened, reshape to [num_samples, bc_order, num_groups]
     if dir == -1:
-        legendre_values = legendre[:,:num_ordinates//2]
+        legendre_values = legendre_np[:,:num_ordinates//2]
     elif dir == 1:
-        legendre_values = legendre[:,num_ordinates//2:]
+        legendre_values = legendre_np[:,num_ordinates//2:]
     moments = np.reshape(moments, [-1, bc_order, num_groups])
     flux = []
     for g in range(num_groups):
